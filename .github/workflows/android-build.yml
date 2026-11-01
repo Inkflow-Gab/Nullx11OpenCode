@@ -44,7 +44,7 @@ jobs:
         run: bash ./scripts/ensure-android-platform.sh 37
 
       - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace
+        run: bash ./gradlew :app:assembleDebug --stacktrace
 
       - name: Prepare branded APK filename
         run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/nullx11-OC-debug.apk
