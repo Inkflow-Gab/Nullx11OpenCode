@@ -1,20 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Canonical OpenCode Mobile on-device launcher icon source.
+  Canonical nullx11-OC Android launcher icon source.
 
-  Flat geometry traced from the 3D “d” mark. Lighting is NOT baked in —
-  iOS 26 Liquid Glass (AppIcon.icon) and Android adaptive parallax supply depth.
+  A geometric N mark and terminal cursor use a high-contrast midnight/teal
+  palette for clearer recognition at small launcher sizes.
 
   This SVG feeds scripts/sync-app-icon.mjs (npm run app-icon:sync) and the
   flattened store rasters (npm run app-icon:sync-store).
   See docs/design-system/app-icon.md.
 
   Layers (by fill):
-    #4B4646  body — one closed path (bowl + stem) so the stem join cannot
-             rasterize as a hairline. Bowl ends at the diagonal joint.
-    #F1ECEC  glass cap (upper-left arc)
-  The left joint is a diagonal across the stroke (outer ~174.5°, inner ~196.5°),
-  matching the 3D reference chevron — not a radial cut.
+    #45E0C1  N-shaped primary mark
+    #F1ECEC  cursor square accent
   The generator splits those fills into Icon Composer layers.
 
   Coordinate space mirrors the Android adaptive-icon foreground vector:
@@ -29,9 +26,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 240 300">
   <!-- @opencode/background -->
   <rect x="0" y="0" width="240" height="300" fill="#090D18"/>
-  <!-- @opencode/glyph -->
+  <!-- @opencode/glyph: a bold nullx11 N mark with a terminal cursor accent. -->
   <g transform="translate(14.4,18) scale(0.88,1.1)">
-    <path d="M 179.844 120.873 A 58.194 58.194 0 0 1 63.725 126.450 L 83.892 109.688 A 39.380 39.380 0 1 0 161.030 120.873 L 161.030 74.041 L 179.588 55.227 L 179.844 55.227 Z" fill="#45E0C1"/>
-    <path d="M 63.725 126.450 A 58.194 58.194 0 0 1 157.189 74.791 L 145.700 89.689 A 39.380 39.380 0 0 0 83.892 109.688 Z" fill="#E8F4FF"/>
+    <path d="M 46 40 H 82 L 158 120 V 40 H 194 V 200 H 158 L 82 120 V 200 H 46 Z" fill="#45E0C1"/>
+    <path d="M 162 158 H 188 V 184 H 162 Z" fill="#F1ECEC"/>
   </g>
 </svg>

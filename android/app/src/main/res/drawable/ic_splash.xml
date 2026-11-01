@@ -4,15 +4,19 @@
     android:height="108dp"
     android:viewportWidth="240"
     android:viewportHeight="300">
-  <group android:scaleX="0.88"
-      android:scaleY="1.1"
-      android:translateX="14.4"
-      android:translateY="18">
-    <path
-        android:pathData="M 179.844 120.873 A 58.194 58.194 0 0 1 63.725 126.450 L 83.892 109.688 A 39.380 39.380 0 1 0 161.030 120.873 L 161.030 74.041 L 179.588 55.227 L 179.844 55.227 Z"
-        android:fillColor="@color/splash_glyph_body" />
-    <path
-        android:pathData="M 63.725 126.450 A 58.194 58.194 0 0 1 157.189 74.791 L 145.700 89.689 A 39.380 39.380 0 0 0 83.892 109.688 Z"
-        android:fillColor="@color/splash_glyph_glass" />
-  </group>
+    <group
+        android:name="splashMark"
+        android:pivotX="120"
+        android:pivotY="150"
+        android:scaleX="0.88"
+        android:scaleY="1.1"
+        android:translateX="14.4"
+        android:translateY="18">
+        <path
+            android:fillColor="@color/splash_glyph_body"
+            android:pathData="M46,40h36l76,80V40h36v160h-36L82,120v80H46z" />
+        <path
+            android:fillColor="@color/splash_glyph_glass"
+            android:pathData="M162,158h26v26h-26z" />
+    </group>
 </vector>

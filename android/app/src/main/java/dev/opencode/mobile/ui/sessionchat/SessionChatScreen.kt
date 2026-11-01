@@ -110,7 +110,6 @@ import dev.opencode.mobile.ui.components.OpenCodeInlineNoticeVariant
 import dev.opencode.mobile.ui.components.OpenCodeLayout
 import dev.opencode.mobile.ui.components.OpenCodeListItem
 import dev.opencode.mobile.ui.sessionchat.view.SessionChatSkillLibrarySheet
-import dev.opencode.mobile.ui.components.OpenCodeListItem
 import dev.opencode.mobile.ui.components.OpenCodeOverflowMenuEntry
 import dev.opencode.mobile.ui.components.OpenCodePendingPromptsStrip
 import dev.opencode.mobile.ui.components.OpenCodeReadableColumn
