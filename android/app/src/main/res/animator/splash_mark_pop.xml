@@ -3,14 +3,14 @@
     android:ordering="together">
     <objectAnimator
         android:duration="760"
-        android:interpolator="@android:interpolator/overshoot"
+        android:interpolator="@android:interpolator/fast_out_slow_in"
         android:propertyName="scaleX"
         android:valueFrom="0.72"
         android:valueTo="1.0"
         android:valueType="floatType" />
     <objectAnimator
         android:duration="760"
-        android:interpolator="@android:interpolator/overshoot"
+        android:interpolator="@android:interpolator/fast_out_slow_in"
         android:propertyName="scaleY"
         android:valueFrom="0.72"
         android:valueTo="1.0"
