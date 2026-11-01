@@ -2220,6 +2220,7 @@ class SessionChatViewModel
                 atSuggestionsVisible = composerState.atSuggestionsVisible,
                 atSuggestions = composerState.atSuggestions,
                 commandsSheetVisible = commandsState.commandsSheetVisible,
+                serverSkills = composerState.serverCommands.filter { it.isV2Skill },
                 visibleClientSlashActions = commandsState.visibleActions,
                 mcpPageVisible = commandsState.mcpPageVisible,
                 mcpServers = commandsState.mcpServers,

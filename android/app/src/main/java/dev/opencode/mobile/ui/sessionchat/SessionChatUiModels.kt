@@ -280,6 +280,7 @@ data class SessionChatUiState(
     val atSuggestionsVisible: Boolean = false,
     val atSuggestions: List<SessionChatAtSuggestion> = emptyList(),
     val commandsSheetVisible: Boolean = false,
+    val serverSkills: List<ServerCommand> = emptyList(),
     val visibleClientSlashActions: List<ClientSlashAction> =
         listOf(ClientSlashAction.New, ClientSlashAction.Terminal, ClientSlashAction.Files, ClientSlashAction.Mcp),
     val mcpPageVisible: Boolean = false,

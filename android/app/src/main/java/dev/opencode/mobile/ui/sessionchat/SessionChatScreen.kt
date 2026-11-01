@@ -109,6 +109,8 @@ import dev.opencode.mobile.ui.components.OpenCodeInlineNotice
 import dev.opencode.mobile.ui.components.OpenCodeInlineNoticeVariant
 import dev.opencode.mobile.ui.components.OpenCodeLayout
 import dev.opencode.mobile.ui.components.OpenCodeListItem
+import dev.opencode.mobile.ui.sessionchat.view.SessionChatSkillLibrarySheet
+import dev.opencode.mobile.ui.components.OpenCodeListItem
 import dev.opencode.mobile.ui.components.OpenCodeOverflowMenuEntry
 import dev.opencode.mobile.ui.components.OpenCodePendingPromptsStrip
 import dev.opencode.mobile.ui.components.OpenCodeReadableColumn
@@ -284,6 +286,7 @@ private fun SessionChatScreenBody(
     var showPendingPromptsSheet by rememberSaveable { mutableStateOf(false) }
     var toolDetailTarget by remember { mutableStateOf<SessionChatToolDetailTarget?>(null) }
     var skillsTarget by remember { mutableStateOf<SessionChatSkillsTarget?>(null) }
+    var showSkillLibrary by rememberSaveable { mutableStateOf(false) }
     var showSessionTodosSheet by rememberSaveable { mutableStateOf(false) }
     var holdingFinishedTodos by remember { mutableStateOf(false) }
     var sawUnfinishedTodos by remember { mutableStateOf(false) }
@@ -1719,14 +1722,37 @@ private fun SessionChatScreenBody(
                     summary = uiState.mcpSummary,
                 )
             } else {
-                CommandsActionTileGrid(
-                    actions = uiState.visibleClientSlashActions,
-                    canMutate = sessionCreated && uiState.canMutate,
-                    mcpBadge = uiState.mcpSummary.toActionTileBadge(),
-                    onAction = viewModel::runClientSlashAction,
-                )
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    CommandsActionTileGrid(
+                        actions = uiState.visibleClientSlashActions,
+                        canMutate = sessionCreated && uiState.canMutate,
+                        mcpBadge = uiState.mcpSummary.toActionTileBadge(),
+                        onAction = viewModel::runClientSlashAction,
+                    )
+                    if (uiState.serverSkills.isNotEmpty()) {
+                        OpenCodeListItem(
+                            title = "Skill library",
+                            subtitle = "${uiState.serverSkills.size} skills available from this server",
+                            onClick = {
+                                viewModel.dismissCommands()
+                                showSkillLibrary = true
+                            },
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                        )
+                    }
+                }
             }
         }
+
+        SessionChatSkillLibrarySheet(
+            visible = showSkillLibrary,
+            skills = uiState.serverSkills,
+            onDismiss = { showSkillLibrary = false },
+            onUseSkill = { skill ->
+                showSkillLibrary = false
+                viewModel.selectSlashSuggestion(skill.name)
+            },
+        )
 
         OpenCodeDialog(
             visible = uiState.forkDialogVisible,
