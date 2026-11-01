@@ -15,7 +15,6 @@ import androidx.compose.ui.unit.dp
 import dev.opencode.mobile.domain.command.ServerCommand
 import dev.opencode.mobile.ui.components.OpenCodeBottomSheet
 import dev.opencode.mobile.ui.components.OpenCodeListItem
-import dev.opencode.mobile.ui.components.OpenCodeTextField
 
 /** Searchable library of skills currently advertised by the connected server. */
 @Composable
