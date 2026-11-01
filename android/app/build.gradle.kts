@@ -106,7 +106,7 @@ android {
     // Pin NDK so release builds can package native debug symbols for Play.
     ndkVersion = "27.2.12479018"
     defaultConfig {
-        applicationId = "dev.opencode.mobile"
+        applicationId = "com.nullx11Open.Official"
         minSdk = 24
         targetSdk = 36
         versionCode = releaseVersionCode ?: 1

@@ -1,15 +1,27 @@
-name: Android Build
+name: Android APK Build
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "android/**"
+      - "shared/**"
+      - "VERSION"
+      - "scripts/ensure-android-platform.sh"
+      - ".github/workflows/android-build.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    if: github.repository == 'opencode-mobile/opencode-mobile'
-    runs-on: [self-hosted, Linux, X64, android]
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: android
@@ -17,6 +29,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Set up JDK 17
         uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
@@ -25,9 +38,21 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
       - name: Install Android compile SDK 37
         working-directory: .
         run: ./scripts/ensure-android-platform.sh 37
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Prepare branded APK filename
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/nullx11-OC-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nullx11-OC-android-debug-apk
+          path: android/app/build/outputs/apk/debug/nullx11-OC-debug.apk
+          if-no-files-found: error
+          retention-days: 14
