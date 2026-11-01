@@ -1,0 +1,104 @@
+name: iOS Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Skip when the change cannot affect the iOS app. The iOS build compiles
+    # shared/markdown-core through the android/ Gradle build, so Gradle config
+    # counts; the Android app and screenshot modules do not.
+    paths:
+      - "ios/**"
+      - "shared/**"
+      - "android/**"
+      - "!android/app/**"
+      - "!android/screenshot/**"
+      - "VERSION"
+      - "scripts/read-app-version.sh"
+      - "scripts/ensure-android-platform.sh"
+      - ".github/scripts/**"
+      - ".github/workflows/ios-checks.yml"
+  workflow_dispatch:
+    inputs:
+      run_markdown_core_ios_tests:
+        description: "Also run markdown-core Kotlin/Native iOS tests (~2–3 min)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-checks:
+    # Self-hosted runner: never run pull requests from forks.
+    if: github.repository == 'opencode-mobile/opencode-mobile' && (github.event_name != 'pull_request' || (!github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: [self-hosted, macOS, mac-mini]
+    defaults:
+      run:
+        working-directory: ios/OpenCode Mobile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate app VERSION
+        working-directory: .
+        run: ./scripts/read-app-version.sh ios
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - name: Install Android compile SDK 37
+        working-directory: .
+        run: ./scripts/ensure-android-platform.sh 37
+
+      # Soft-disabled on PRs to save macOS minutes. The Android unit tests run the
+      # same common tests; this step uniquely covers Kotlin/Native.
+      # Re-enable on every PR: change the if below to always().
+      # One-off: Actions → iOS Checks → Run workflow → enable the input.
+      - name: Run markdown-core iOS tests
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_markdown_core_ios_tests }}
+        working-directory: android
+        run: ./gradlew :markdown-core:iosSimulatorArm64Test --stacktrace
+
+      - name: Resolve Swift Package dependencies
+        run: bash ../../.github/scripts/resolve-ios-packages.sh
+
+      - name: Select iOS Simulator
+        id: simulator
+        run: bash ../../.github/scripts/select-ios-simulator.sh
+
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build \
+            -project "OpenCode Mobile.xcodeproj" \
+            -scheme "OpenCode Mobile" \
+            -configuration Debug \
+            -destination "${{ steps.simulator.outputs.destination }}" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Run static analyzer
+        run: |
+          xcodebuild analyze \
+            -project "OpenCode Mobile.xcodeproj" \
+            -scheme "OpenCode Mobile" \
+            -configuration Debug \
+            -destination "${{ steps.simulator.outputs.destination }}" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project "OpenCode Mobile.xcodeproj" \
+            -scheme "OpenCode Mobile" \
+            -configuration Debug \
+            -destination "${{ steps.simulator.outputs.destination }}" \
+            -only-testing:"OpenCode MobileTests" \
+            CODE_SIGNING_ALLOWED=NO

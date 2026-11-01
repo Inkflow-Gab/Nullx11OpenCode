@@ -1,0 +1,207 @@
+openapi: 3.1.0
+info:
+  title: opencode messages
+  description: Messages API subset for opencode-mobile (maintained until /doc includes message paths).
+  version: 1.0.0
+servers:
+  - url: http://127.0.0.1:4096
+paths:
+  /session/{id}/message:
+    get:
+      operationId: listMessages
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: Message list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Message"
+    post:
+      operationId: sendMessage
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "200":
+          description: Created or updated message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+  /session/{id}/message/{messageID}:
+    get:
+      operationId: getMessage
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/MessageId"
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+  /session/{id}/prompt_async:
+    post:
+      operationId: sendPromptAsync
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "204":
+          description: Prompt accepted
+components:
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    MessageId:
+      name: messageID
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    SendMessageRequest:
+      type: object
+      required: [parts]
+      properties:
+        model:
+          $ref: "#/components/schemas/SendPromptModel"
+        variant:
+          type: string
+        agent:
+          type: string
+        parts:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessagePartInput"
+    SendPromptModel:
+      type: object
+      required: [providerID, modelID]
+      properties:
+        providerID:
+          type: string
+        modelID:
+          type: string
+    MessagePartInput:
+      oneOf:
+        - $ref: "#/components/schemas/TextPartInput"
+        - $ref: "#/components/schemas/FilePartInput"
+    TextPartInput:
+      type: object
+      required: [type, text]
+      properties:
+        type:
+          type: string
+          const: text
+        text:
+          type: string
+    FilePartInput:
+      type: object
+      required: [type, mime, url]
+      properties:
+        id:
+          type: string
+          pattern: "^prt"
+          description: Optional. When present must match ^prt; omit for client-generated local attachment ids.
+        type:
+          type: string
+          const: file
+        mime:
+          type: string
+        filename:
+          type: string
+        url:
+          type: string
+    Message:
+      type: object
+      required: [info, parts]
+      properties:
+        info:
+          $ref: "#/components/schemas/MessageInfo"
+        parts:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessagePart"
+    MessageInfo:
+      type: object
+      required: [id, role]
+      properties:
+        id:
+          type: string
+        sessionID:
+          type: string
+        role:
+          type: string
+        agent:
+          type: string
+        mode:
+          type: string
+        model:
+          $ref: "#/components/schemas/MessageModelRef"
+        modelID:
+          type: string
+        providerID:
+          type: string
+        variant:
+          type: string
+        parentID:
+          type: string
+        time:
+          $ref: "#/components/schemas/MessageTime"
+    MessageModelRef:
+      type: object
+      properties:
+        modelID:
+          type: string
+        providerID:
+          type: string
+    MessageTime:
+      type: object
+      properties:
+        created:
+          type: integer
+          format: int64
+        completed:
+          type: integer
+          format: int64
+    MessagePart:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+        text:
+          type: string
+        id:
+          type: string
+        sessionID:
+          type: string
+        messageID:
+          type: string
+        tool:
+          type: string
+        mime:
+          type: string
+        filename:
+          type: string
+        url:
+          type: string

@@ -1,0 +1,496 @@
+package dev.opencode.mobile.domain.message
+
+import dev.opencode.mobile.domain.diagnostic.DiagnosticLog
+import dev.opencode.mobile.domain.diagnostic.DiagnosticLogArea
+import dev.opencode.mobile.markdown.HighlightIntent
+import dev.opencode.mobile.markdown.HighlightResult
+import dev.opencode.mobile.markdown.HighlightRevision
+import dev.opencode.mobile.markdown.MarkdownCodeFence
+import dev.opencode.mobile.markdown.MarkdownDocument
+import dev.opencode.mobile.markdown.MarkdownHighlightAttachment
+import dev.opencode.mobile.markdown.OpenCodeMarkdownDetector
+import dev.opencode.mobile.markdown.OpenCodeMarkdownParser
+import dev.opencode.mobile.markdown.OpenCodeStructureOnlyHighlighter
+import dev.opencode.mobile.markdown.TextMateHighlightingEngine
+import dev.opencode.mobile.markdown.TextMateParseOutcome
+import dev.opencode.mobile.markdown.attachTextMateResult
+import dev.opencode.mobile.markdown.codeFences
+import dev.opencode.mobile.markdown.stableMarkdownSourceHash
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
+
+@Singleton
+class MessageContentPreparer
+    @Inject
+    constructor(
+        private val textMateEngine: TextMateHighlightingEngine,
+    ) {
+        internal var computationDispatcher: CoroutineDispatcher = Dispatchers.Default
+        private val nextHighlightRevision = AtomicLong(0)
+
+        private val cacheLock = Any()
+        private val cache =
+            object : LinkedHashMap<CacheKey, MarkdownDocument>(MAX_CACHE_ENTRIES + 1, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<CacheKey, MarkdownDocument>?): Boolean =
+                    size > MAX_CACHE_ENTRIES
+            }
+
+        fun clearDocumentCache() {
+            synchronized(cacheLock) { cache.clear() }
+        }
+
+        suspend fun prepareMessages(
+            messages: List<Message>,
+            previousById: Map<String, DisplayMessage> = emptyMap(),
+            mode: MessagePreparationMode = MessagePreparationMode.Final,
+        ): List<DisplayMessage> =
+            withContext(computationDispatcher) {
+                var parsedCount = 0
+                var reusedCount = 0
+                val startedAt = System.nanoTime()
+                val prepared = ArrayList<DisplayMessage>(messages.size)
+                for (message in messages) {
+                    val previous = previousById[message.id]
+                    val display =
+                        prepareMessageOnWorker(
+                            message = message,
+                            previous = previous,
+                            mode = mode,
+                        )
+                    prepared += display
+                    when {
+                        display.renderedMarkdown == null -> Unit
+                        previous?.renderedMarkdown != null &&
+                            display.renderedMarkdown === previous.renderedMarkdown -> reusedCount++
+                        else -> parsedCount++
+                    }
+                }
+                val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+                logI(
+                    "prepareMessages count=${messages.size} parsed=$parsedCount reused=$reusedCount " +
+                        "markdown=${prepared.count { it.renderedMarkdown != null }} " +
+                        "mode=$mode ms=$elapsedMs",
+                )
+                prepared
+            }
+
+        suspend fun prepareOptimisticUserMessage(
+            id: String,
+            text: String,
+            attachments: List<Attachment> = emptyList(),
+        ): DisplayMessage =
+            prepareMessage(
+                Message(
+                    id = id,
+                    role = MessageRole.User,
+                    text = text,
+                    parts =
+                        buildList {
+                            if (text.isNotBlank()) add(MessagePart.Text(text))
+                            attachments.forEach { attachment ->
+                                add(
+                                    MessagePart.File(
+                                        id = attachment.id,
+                                        filename = attachment.filename,
+                                        mime = attachment.mime,
+                                        kind = attachment.kind,
+                                        dataUrl = "",
+                                        serverPath = attachment.uploadedServerPath,
+                                    ),
+                                )
+                            }
+                        },
+                ),
+                mode = MessagePreparationMode.Final,
+            )
+
+        suspend fun prepareMessage(
+            message: Message,
+            previous: DisplayMessage? = null,
+            mode: MessagePreparationMode = MessagePreparationMode.Final,
+            sessionKey: String = "",
+        ): DisplayMessage =
+            withContext(computationDispatcher) {
+                prepareMessageOnWorker(message, previous, mode, sessionKey)
+            }
+
+        /**
+         * Format-first streaming paint: always structure when markdown is detected, with
+         * empty code spans. Colors attach in [highlightStreamingTextBlock] after this
+         * frame publishes. Never writes the preparer LRU.
+         */
+        suspend fun prepareStructureOnlyTextBlock(
+            blockID: String,
+            plain: String,
+            sessionKey: String = "",
+        ): MarkdownDocument? =
+            withContext(computationDispatcher) {
+                if (!OpenCodeMarkdownDetector.shouldRender(plain)) {
+                    return@withContext null
+                }
+                try {
+                    OpenCodeMarkdownParser.parse(
+                        markdown = plain,
+                        codeHighlighter = OpenCodeStructureOnlyHighlighter,
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    logI(
+                        "prepareStructureOnlyFallback blockIdHash=${blockID.hashCode()} " +
+                            "sessionKeyHash=${sessionKey.hashCode()} reason=${error.javaClass.simpleName}",
+                    )
+                    null
+                }
+            }
+
+        /**
+         * Colors one streaming block's fences. Does not write the preparer LRU; the
+         * highlight-core session is the cache, keyed so a growing fence re-lexes from
+         * its last changed line. A deadline comes back [StreamingHighlight.partial].
+         */
+        suspend fun highlightStreamingTextBlock(
+            blockID: String,
+            plain: String,
+            sessionKey: String = "",
+        ): StreamingHighlight? =
+            withContext(computationDispatcher) {
+                if (!OpenCodeMarkdownDetector.shouldRender(plain)) {
+                    return@withContext null
+                }
+                try {
+                    val structure =
+                        OpenCodeMarkdownParser.parse(
+                            markdown = plain,
+                            codeHighlighter = OpenCodeStructureOnlyHighlighter,
+                        )
+                    val revision = HighlightRevision(nextHighlightRevision.incrementAndGet())
+                    val fences =
+                        structure.codeFences(
+                            ownerKey = "${sessionKey.length}:$sessionKey:$blockID",
+                            revision = revision,
+                            policyEpoch = HIGHLIGHT_POLICY_EPOCH,
+                        )
+                    var upgraded = structure
+                    var partial = false
+                    for (fence in fences) {
+                        coroutineContext.ensureActive()
+                        val result = textMateEngine.highlight(fence.request(intent = HighlightIntent.InteractiveFinal))
+                        if (result.outcome == TextMateParseOutcome.Partial) {
+                            partial = true
+                        }
+                        when (val attachment = upgraded.attachTextMateResult(fence, result)) {
+                            is MarkdownHighlightAttachment.Attached -> upgraded = attachment.document
+                            is MarkdownHighlightAttachment.Rejected -> Unit
+                        }
+                    }
+                    StreamingHighlight(document = upgraded, partial = partial)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    logI(
+                        "highlightStreamingFallback blockIdHash=${blockID.hashCode()} " +
+                            "sessionKeyHash=${sessionKey.hashCode()} reason=${error.javaClass.simpleName}",
+                    )
+                    null
+                }
+            }
+
+        private suspend fun prepareMessageOnWorker(
+            message: Message,
+            previous: DisplayMessage?,
+            mode: MessagePreparationMode,
+            sessionKey: String = "",
+        ): DisplayMessage {
+            val isStreaming = messageIsStreaming(message)
+            if (mode == MessagePreparationMode.HistoryPlainFirst) {
+                reusableDocument(message, previous, mode)?.let { reusable ->
+                    return DisplayMessage(
+                        message = message,
+                        renderedMarkdown = reusable,
+                        awaitingTextMateUpgrade = previous?.awaitingTextMateUpgrade == true,
+                    )
+                }
+                if (!OpenCodeMarkdownDetector.shouldRender(message.text)) {
+                    return DisplayMessage(
+                        message = message,
+                        renderedMarkdown = null,
+                    )
+                }
+                val document =
+                    try {
+                        OpenCodeMarkdownParser.parse(
+                            markdown = message.text,
+                            codeHighlighter = OpenCodeStructureOnlyHighlighter,
+                        )
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        logI(
+                            "historyFormatFirstFallback messageIdHash=${message.id.hashCode()} " +
+                                "reason=${error.javaClass.simpleName}",
+                        )
+                        null
+                    }
+                return DisplayMessage(
+                    message = message,
+                    renderedMarkdown = document,
+                    // Colors arrive in HistoryEnrichment / Final.
+                    awaitingTextMateUpgrade = document != null,
+                )
+            }
+            if (!OpenCodeMarkdownDetector.shouldRender(message.text)) {
+                return DisplayMessage(
+                    message = message,
+                    renderedMarkdown = null,
+                )
+            }
+            val reused = reusableDocument(message, previous, mode)
+            val parsed =
+                if (reused == null && mode != MessagePreparationMode.FinalPlaceholder) {
+                    parseDocumentSafely(
+                        sessionKey = sessionKey,
+                        blockID = message.id,
+                        text = message.text,
+                        isStreaming = isStreaming,
+                        intent = mode.highlightIntent(),
+                    )
+                } else {
+                    null
+                }
+            val document =
+                reused
+                    ?: if (mode == MessagePreparationMode.FinalPlaceholder) {
+                        previous?.renderedMarkdown
+                    } else {
+                        parsed?.document
+                    }
+            val awaitingTextMateUpgrade =
+                when {
+                    mode == MessagePreparationMode.FinalPlaceholder && document != null ->
+                        previous?.awaitingTextMateUpgrade == true || previous?.isStreaming == true
+                    reused != null -> previous?.awaitingTextMateUpgrade == true
+                    // A fence that is still partial, cancelled, or failed for now gets another pass.
+                    else -> parsed?.settled == false
+                }
+            return DisplayMessage(
+                message = message,
+                renderedMarkdown = document,
+                awaitingTextMateUpgrade = awaitingTextMateUpgrade,
+            )
+        }
+
+        private fun messageIsStreaming(message: Message): Boolean =
+            message.parts.any { part -> part is MessagePart.Text && part.isStreaming }
+
+        private suspend fun parseDocumentSafely(
+            sessionKey: String,
+            blockID: String,
+            text: String,
+            isStreaming: Boolean,
+            intent: HighlightIntent,
+        ): ParsedDocument? =
+            try {
+                parseDocument(
+                    sessionKey = sessionKey,
+                    blockID = blockID,
+                    text = text,
+                    isStreaming = isStreaming,
+                    intent = intent,
+                )
+            } catch (cancelled: kotlin.coroutines.cancellation.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                logI("preparePlainFallback blockIdHash=${blockID.hashCode()} reason=${error.javaClass.simpleName}")
+                null
+            }
+
+        /**
+         * Structure first, then each code fence through [textMateEngine] (highlight-core).
+         * A still-streaming prepare keeps empty spans; the live path colors those fences
+         * in [highlightStreamingTextBlock] after the structure frame.
+         *
+         * A fence past its deadline is asked again until it completes or stops making
+         * progress. Only a settled document, every fence colored for good, enters the LRU.
+         */
+        private suspend fun parseDocument(
+            sessionKey: String,
+            blockID: String,
+            text: String,
+            isStreaming: Boolean,
+            intent: HighlightIntent,
+        ): ParsedDocument? {
+            if (!OpenCodeMarkdownDetector.shouldRender(text)) {
+                return null
+            }
+            val cacheKey =
+                CacheKey(
+                    sessionKey = sessionKey,
+                    blockID = blockID,
+                    textHash = stableMarkdownSourceHash(text),
+                    textLength = text.length,
+                    exactSource = text,
+                    isStreaming = isStreaming,
+                )
+            synchronized(cacheLock) {
+                cache[cacheKey]?.let { return ParsedDocument(it, settled = true) }
+            }
+            val structure =
+                OpenCodeMarkdownParser.parse(
+                    markdown = text,
+                    codeHighlighter = OpenCodeStructureOnlyHighlighter,
+                )
+            var document = structure
+            var settled = true
+            if (!isStreaming) {
+                val revision = HighlightRevision(nextHighlightRevision.incrementAndGet())
+                val fences =
+                    structure.codeFences(
+                        ownerKey = "${sessionKey.length}:$sessionKey:$blockID",
+                        revision = revision,
+                        policyEpoch = HIGHLIGHT_POLICY_EPOCH,
+                    )
+                for (fence in fences) {
+                    coroutineContext.ensureActive()
+                    val result = highlightUntilSettled(fence, intent)
+                    when (val attachment = document.attachTextMateResult(fence, result)) {
+                        is MarkdownHighlightAttachment.Attached -> {
+                            document = attachment.document
+                            if (result.outcome == TextMateParseOutcome.Partial) settled = false
+                        }
+                        is MarkdownHighlightAttachment.Rejected ->
+                            // A failure with a diagnostic is the lexer's answer for this text; anything
+                            // else (cancelled, failed without a reason, stale) may color next time.
+                            if (result.outcome != TextMateParseOutcome.Failed || result.diagnostics.isEmpty()) {
+                                settled = false
+                            }
+                    }
+                }
+            }
+            if (!settled) {
+                // Never cache a half-plain document; one a concurrent prepare settled is better.
+                return synchronized(cacheLock) { cache[cacheKey] }?.let { ParsedDocument(it, settled = true) }
+                    ?: ParsedDocument(document, settled = false)
+            }
+            synchronized(cacheLock) { cache[cacheKey] = document }
+            return ParsedDocument(document, settled = true)
+        }
+
+        /**
+         * Asks the engine for [fence] again (same key and revision) while it comes back
+         * [TextMateParseOutcome.Partial], so the session continues from its colored prefix.
+         * Gives up after two calls in a row add no spans.
+         */
+        private suspend fun highlightUntilSettled(
+            fence: MarkdownCodeFence,
+            intent: HighlightIntent,
+        ): HighlightResult {
+            var result = textMateEngine.highlight(fence.request(intent = intent))
+            var stalled = false
+            while (result.outcome == TextMateParseOutcome.Partial) {
+                coroutineContext.ensureActive()
+                val next = textMateEngine.highlight(fence.request(intent = intent))
+                val unchanged = next.outcome == TextMateParseOutcome.Partial && next.spans == result.spans
+                result = next
+                if (unchanged && stalled) break
+                stalled = unchanged
+            }
+            return result
+        }
+
+        private fun reusableDocument(
+            message: Message,
+            previous: DisplayMessage?,
+            mode: MessagePreparationMode,
+        ): MarkdownDocument? {
+            val isStreaming = messageIsStreaming(message)
+            val existing = previous?.renderedMarkdown
+            // Final must not settle-reuse a FinalPlaceholder that still holds a
+            // streaming structure-only parse (`awaitingTextMateUpgrade`).
+            if (existing != null &&
+                !isStreaming &&
+                previous.isStreaming != true &&
+                !previous.awaitingTextMateUpgrade &&
+                previous.text == message.text
+            ) {
+                return existing
+            }
+            if (isStreaming &&
+                previous != null &&
+                previous.isStreaming &&
+                previous.text == message.text
+            ) {
+                return previous.renderedMarkdown
+            }
+            if (mode == MessagePreparationMode.FinalPlaceholder &&
+                !isStreaming &&
+                previous != null &&
+                previous.isStreaming &&
+                previous.text == message.text
+            ) {
+                return previous.renderedMarkdown
+            }
+            return null
+        }
+
+        private fun logI(message: String) {
+            DiagnosticLog.info(DiagnosticLogArea.Chat, message)
+        }
+
+        companion object {
+            private const val MAX_CACHE_ENTRIES = 32
+
+            /** Highlighting policy never changes at runtime now that there is one engine (#872). */
+            private const val HIGHLIGHT_POLICY_EPOCH = 0L
+
+            /**
+             * Size used by characterization fixtures. Streaming no longer skips
+             * markdown or highlighting on length.
+             */
+            const val STREAMING_PLAIN_TEXT_CHARACTER_THRESHOLD = 8_000
+
+            /** Open histories above this markdown-candidate size as plain text first. */
+            const val HISTORY_PLAIN_FIRST_MARKDOWN_CHARACTER_THRESHOLD = 4_000
+
+            /**
+             * Legacy flag: format-first history is always published immediately.
+             * Enrichment still upgrades highlight-core colors newest-first afterward.
+             */
+            const val HOLD_READY_UNTIL_NEWEST_MARKDOWN = false
+
+            /** Newest-first enrich publishes once the open viewport is ready. */
+            const val HISTORY_ENRICH_VIEWPORT_MESSAGE_COUNT = 3
+
+            /** Character budget for the initial enrichment viewport batch. */
+            const val HISTORY_ENRICH_VIEWPORT_CHARACTER_BUDGET = 12_000
+        }
+
+        private class ParsedDocument(
+            val document: MarkdownDocument,
+            /** False while a fence is partial, cancelled, or failed without a reason. */
+            val settled: Boolean,
+        )
+
+        private data class CacheKey(
+            val sessionKey: String,
+            val blockID: String,
+            val textHash: Int,
+            val textLength: Int,
+            val exactSource: String,
+            val isStreaming: Boolean,
+        )
+
+        private fun MessagePreparationMode.highlightIntent(): HighlightIntent =
+            when (this) {
+                MessagePreparationMode.Final -> HighlightIntent.InteractiveFinal
+                MessagePreparationMode.HistoryEnrichment -> HighlightIntent.VisibleHistory
+                else -> HighlightIntent.BackgroundHistory
+            }
+    }

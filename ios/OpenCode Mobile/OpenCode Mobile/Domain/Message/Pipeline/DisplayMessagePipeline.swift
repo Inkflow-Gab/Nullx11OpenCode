@@ -1,0 +1,1051 @@
+import FactoryKit
+import Foundation
+import UIKit
+
+/// Open window that coalesces a burst of streaming tokens into one UI frame.
+nonisolated let streamingPrepareDebounceNs: UInt64 = 80_000_000
+/// Cap how long dense SSE bursts can delay a UI publish. Keep this flat so
+/// long replies do not intentionally slow down as they grow.
+nonisolated let streamingPrepareMaxBatchDuration: Duration = .milliseconds(160)
+
+nonisolated final class DisplayMessagePipeline: @unchecked Sendable {
+    private let snapshotSource: any DisplayMessageSnapshotSource
+    private let contentPreparer: any DisplayMessagePreparing
+    private let clock: any DisplayMessagePipelineClock
+    private let messageSync: MessageSync?
+    private let connectionProfileIDProvider: @Sendable () -> String
+    private let preparedHistoryCache: PreparedHistoryCache
+    private let decorationCache: BlockDecorationCache
+    private var memoryPressureObserver: NSObjectProtocol?
+
+    init(
+        messageSync: MessageSync,
+        contentPreparer: MessageContentPreparer,
+        clock: (any DisplayMessagePipelineClock)? = nil,
+        connectionProfileIDProvider: @escaping @Sendable () -> String = { "local" },
+        preparedHistoryCache: PreparedHistoryCache? = nil,
+        decorationCache: BlockDecorationCache = .shared
+    ) {
+        self.snapshotSource = messageSync
+        self.contentPreparer = contentPreparer
+        self.clock = clock ?? SystemDisplayMessagePipelineClock()
+        self.messageSync = messageSync
+        self.connectionProfileIDProvider = connectionProfileIDProvider
+        self.preparedHistoryCache = preparedHistoryCache ?? PreparedHistoryCache()
+        self.decorationCache = decorationCache
+        observeMemoryPressure()
+    }
+
+    init(
+        snapshotSource: any DisplayMessageSnapshotSource,
+        contentPreparer: any DisplayMessagePreparing,
+        clock: (any DisplayMessagePipelineClock)? = nil,
+        messageSync: MessageSync? = nil,
+        connectionProfileIDProvider: @escaping @Sendable () -> String = { "local" },
+        preparedHistoryCache: PreparedHistoryCache? = nil,
+        decorationCache: BlockDecorationCache = .shared
+    ) {
+        self.snapshotSource = snapshotSource
+        self.contentPreparer = contentPreparer
+        self.clock = clock ?? SystemDisplayMessagePipelineClock()
+        self.messageSync = messageSync
+        self.connectionProfileIDProvider = connectionProfileIDProvider
+        self.preparedHistoryCache = preparedHistoryCache ?? PreparedHistoryCache()
+        self.decorationCache = decorationCache
+    }
+
+    deinit {
+        if let memoryPressureObserver {
+            NotificationCenter.default.removeObserver(memoryPressureObserver)
+        }
+    }
+
+    func clearPreparedCache() {
+        preparedHistoryCache.removeAll(reason: "cache-reset")
+    }
+
+    func removePreparedCache(sessionID: String) {
+        preparedHistoryCache.removeSession(sessionID: sessionID)
+    }
+
+    /// Warm reopen rows from the in-memory store, with prepared markdown attached
+    /// when the per-session cache is complete (Android-like instant styled open).
+    func peekWarmDisplayMessages(sessionID: String, directory: String? = nil) -> [DisplayMessage]? {
+        guard let messageSync else { return nil }
+        let messages = messageSync.peekStoreMessages(sessionID: sessionID, directory: directory)
+        guard !messages.isEmpty else { return nil }
+        let key = cacheKey(sessionID: sessionID, directory: directory)
+        let cached = preparedHistoryCache.messages(for: key) ?? [:]
+        if hasCompletePreparedMarkdownCache(messages: messages, previousByID: cached) {
+            return messages.map { message in
+                cached[message.id] ?? DisplayMessage(message: message, renderedMarkdown: nil)
+            }
+        }
+        return messages.map { DisplayMessage(message: $0, renderedMarkdown: nil) }
+    }
+
+    private func cacheKey(sessionID: String, directory: String?) -> PreparedHistoryCacheKey {
+        PreparedHistoryCacheKey(
+            connectionProfileID: connectionProfileIDProvider(),
+            directory: directory,
+            sessionID: sessionID
+        )
+    }
+
+    private func observeMemoryPressure() {
+        memoryPressureObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.preparedHistoryCache.handleMemoryPressure()
+            Task {
+                await Container.codeHighlighter.trim(.critical)
+            }
+        }
+    }
+
+    func observeDisplayMessages(sessionID: String, directory: String?) -> AsyncStream<DisplayMessageListUpdate> {
+        AsyncStream { continuation in
+            let task = Task {
+                let cacheKey = self.cacheKey(sessionID: sessionID, directory: directory)
+                // Recursive lock serializes observation state across the intake loop and
+                // child prepare/enrichment tasks (replaces former @MainActor).
+                let gate = NSRecursiveLock()
+                func synced<T>(_ body: () throws -> T) rethrows -> T {
+                    gate.lock()
+                    defer { gate.unlock() }
+                    return try body()
+                }
+                var previousByID: [String: DisplayMessage] = preparedHistoryCache.messages(for: cacheKey) ?? [:]
+                var pendingMessages: [Message]?
+                var lastPublishedMessages: [Message]?
+                var currentGeneration: UInt64 = 0
+                var debounceTask: Task<Void, Never>?
+                var prepareTask: Task<Void, Never>?
+                var enrichmentTask: Task<Void, Never>?
+                var highlightTask: Task<Void, Never>?
+                var highlightEpoch: UInt64 = 0
+                var streamingDocs: [String: NativeMarkdownDocument] = [:]
+                var lastPublishedAt: Duration?
+                /// True while coalescing a live streaming reply (including in-flight prepare).
+                var isStreamingSession = false
+                var sourceIsFromCache = false
+
+                func isDueForMaxBatch() -> Bool {
+                    guard let lastPublishedAt else { return true }
+                    return clock.now - lastPublishedAt >= streamingPrepareMaxBatchDuration
+                }
+
+                if !previousByID.isEmpty {
+                    OpenCodeLog.messageContent.info(
+                        "displayCache hit session=\(sessionID) count=\(previousByID.count)"
+                    )
+                }
+
+                func emitDisplayMessages(_ messages: [DisplayMessage]) {
+                    let fromCache = synced { sourceIsFromCache }
+                    continuation.yield(.messages(messages, isFromCache: fromCache))
+                }
+
+                func invalidateInFlightWork() {
+                    synced {
+                        debounceTask?.cancel()
+                        debounceTask = nil
+                        prepareTask?.cancel()
+                        prepareTask = nil
+                        enrichmentTask?.cancel()
+                        enrichmentTask = nil
+                        highlightTask?.cancel()
+                        highlightTask = nil
+                    }
+                }
+
+                func nextGeneration() -> UInt64 {
+                    synced {
+                        currentGeneration &+= 1
+                        return currentGeneration
+                    }
+                }
+
+                func isCurrent(_ generation: UInt64) -> Bool {
+                    synced { generation == currentGeneration }
+                }
+
+                func commitPrepared(
+                    generation: UInt64,
+                    prepared: [DisplayMessage],
+                    mode: MessagePreparationMode
+                ) -> Bool {
+                    synced {
+                        guard generation == currentGeneration else { return false }
+                        if mode.replacesPreparedCache {
+                            previousByID = Dictionary(
+                                prepared.map { ($0.id, $0) },
+                                uniquingKeysWith: { _, last in last }
+                            )
+                            preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                        } else {
+                            for display in prepared where display.renderedMarkdown != nil {
+                                previousByID[display.id] = display
+                            }
+                            if !previousByID.isEmpty {
+                                preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                            }
+                        }
+                        lastPublishedAt = clock.now
+                        return true
+                    }
+                }
+
+                                func buildStructureFirstStreamingFrame(messages: [Message]) async -> [DisplayMessage] {
+                    var out: [DisplayMessage] = []
+                    out.reserveCapacity(messages.count)
+                    for message in messages {
+                        guard messageHasStreamingText(message) else {
+                            let previous = synced { previousByID[message.id] }
+                            if let previous,
+                               previous.text == message.text,
+                               previous.renderedMarkdown != nil {
+                                // Preserve upgrade metadata so concurrent streams do not
+                                // clear HistoryPlainFirst / enrichment pending flags.
+                                out.append(
+                                    DisplayMessage(
+                                        message: message,
+                                        renderedMarkdown: previous.renderedMarkdown,
+                                        awaitingTextMateUpgrade: previous.awaitingTextMateUpgrade
+                                    )
+                                )
+                            } else {
+                                out.append(DisplayMessage(message: message, renderedMarkdown: nil))
+                            }
+                            continue
+                        }
+                        let target = StreamingTextBlockIdentity.resolveStreaming(message: message)
+                        let parsed: NativeMarkdownDocument?
+                        if let target,
+                           OpenCodeRenderedMarkdownDetector.shouldRender(target.plain) {
+                            parsed = await contentPreparer.prepareStructureOnlyTextBlock(
+                                blockID: target.blockID,
+                                plain: target.plain,
+                                sessionKey: sessionID
+                            )
+                        } else {
+                            parsed = nil
+                        }
+                        let previousDoc = synced { streamingDocs[message.id] }
+                        let structure = parsed?.carryingCodeSpans(from: previousDoc)
+                        if let structure {
+                            synced { streamingDocs[message.id] = structure }
+                        }
+                        if let structure, let target {
+                            decorationCache.put(
+                                sessionKey: sessionID,
+                                blockID: target.blockID,
+                                contentRevision: ContentRevision.of(target.plain),
+                                isStreaming: true,
+                                document: structure
+                            )
+                        }
+                        let bridge =
+                            StreamingTextBlockIdentity.isSoleTextBlock(message: message)
+                            ? structure
+                            : nil
+                        out.append(
+                            DisplayMessage(
+                                message: message,
+                                renderedMarkdown: bridge,
+                                awaitingTextMateUpgrade: structure?.hasUncoloredCodeFence() == true
+                            )
+                        )
+                    }
+                    return out
+                }
+
+                func publishPlainStreamingFrame(generation: UInt64, messages: [Message]) async {
+                    guard isCurrent(generation) else { return }
+                    let frame = await buildStructureFirstStreamingFrame(messages: messages)
+                    let published = synced { () -> Bool in
+                        guard generation == currentGeneration else { return false }
+                        previousByID = Dictionary(
+                            frame.map { ($0.id, $0) },
+                            uniquingKeysWith: { _, last in last }
+                        )
+                        preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                        lastPublishedMessages = messages
+                        lastPublishedAt = clock.now
+                        return true
+                    }
+                    guard published else { return }
+                    OpenCodeLog.messageContent.info(
+                        "displayPublish reason=streaming-structure-first chars=\(streamingMessageCharCount(messages)) generation=\(generation)"
+                    )
+                    emitDisplayMessages(frame)
+                    scheduleStreamingHighlight(generation: generation, messages: messages)
+                }
+
+                func scheduleStreamingHighlight(generation: UInt64, messages: [Message]) {
+                    let epoch: UInt64 = synced {
+                        highlightTask?.cancel()
+                        highlightEpoch &+= 1
+                        return highlightEpoch
+                    }
+                    let targets: [(id: String, blockID: String, plain: String)] = synced {
+                        messages.compactMap { message in
+                            guard messageHasStreamingText(message),
+                                  let target = StreamingTextBlockIdentity.resolveStreaming(message: message),
+                                  OpenCodeRenderedMarkdownDetector.shouldRender(target.plain),
+                                  streamingDocs[message.id]?.hasCodeFence() == true
+                            else {
+                                return nil
+                            }
+                            return (message.id, target.blockID, target.plain)
+                        }
+                    }
+                    guard !targets.isEmpty else { return }
+                    let task = Task {
+                        for target in targets {
+                            var partial = true
+                            var stalled = false
+                            while partial && !Task.isCancelled && isCurrent(generation) && synced({ highlightEpoch == epoch }) {
+                                guard let highlighted = await contentPreparer.highlightStreamingTextBlock(
+                                    blockID: target.blockID,
+                                    plain: target.plain,
+                                    sessionKey: sessionID
+                                ) else {
+                                    break
+                                }
+                                if Task.isCancelled || !isCurrent(generation) || synced({ highlightEpoch != epoch }) {
+                                    return
+                                }
+                                let currentPlain = synced { () -> String? in
+                                    guard let message = lastPublishedMessages?.first(where: { $0.id == target.id }) else {
+                                        return nil
+                                    }
+                                    return StreamingTextBlockIdentity.resolveStreaming(message: message)?.plain
+                                }
+                                guard currentPlain == target.plain else { break }
+                                let unchanged = synced {
+                                    streamingDocs[target.id]?.hasSameCodeSpans(as: highlighted.document) == true
+                                }
+                                if unchanged, !highlighted.partial || stalled {
+                                    break
+                                }
+                                stalled = unchanged
+                                if !unchanged {
+                                    applyStreamingColors(
+                                        messageID: target.id,
+                                        blockID: target.blockID,
+                                        plain: target.plain,
+                                        document: highlighted.document,
+                                        partial: highlighted.partial
+                                    )
+                                }
+                                partial = highlighted.partial
+                            }
+                        }
+                    }
+                    synced {
+                        if highlightEpoch == epoch {
+                            highlightTask = task
+                        } else {
+                            task.cancel()
+                        }
+                    }
+                }
+
+                func applyStreamingColors(
+                    messageID: String,
+                    blockID: String,
+                    plain: String,
+                    document: NativeMarkdownDocument,
+                    partial: Bool
+                ) {
+                    let frame: [DisplayMessage]? = synced {
+                        guard isCurrent(currentGeneration),
+                              let messages = lastPublishedMessages
+                        else {
+                            return nil
+                        }
+                        streamingDocs[messageID] = document
+                        decorationCache.put(
+                            sessionKey: sessionID,
+                            blockID: blockID,
+                            contentRevision: ContentRevision.of(plain),
+                            isStreaming: true,
+                            document: document
+                        )
+                        for message in messages {
+                            if message.id == messageID {
+                                let sole = StreamingTextBlockIdentity.isSoleTextBlock(message: message)
+                                previousByID[message.id] = DisplayMessage(
+                                    message: message,
+                                    renderedMarkdown: sole ? document : nil,
+                                    awaitingTextMateUpgrade: partial
+                                )
+                            }
+                        }
+                        return messages.map { message in
+                            previousByID[message.id] ?? DisplayMessage(message: message, renderedMarkdown: nil)
+                        }
+                    }
+                    if let frame {
+                        emitDisplayMessages(frame)
+                    }
+                }
+
+                func scheduleStreamingPublish(generation: UInt64) {
+                    synced {
+                        guard debounceTask == nil else { return }
+                        debounceTask = Task {
+                            await clock.sleep(for: .nanoseconds(Int64(streamingPrepareDebounceNs)))
+                            guard !Task.isCancelled, isCurrent(generation) else {
+                                synced { debounceTask = nil }
+                                return
+                            }
+                            let latest = synced { () -> [Message]? in
+                                let value = pendingMessages
+                                pendingMessages = nil
+                                return value
+                            }
+                            guard let latest else {
+                                synced { debounceTask = nil }
+                                return
+                            }
+                            await publishPlainStreamingFrame(generation: generation, messages: latest)
+                            let catchUpState = synced { () -> (messages: [Message], generation: UInt64, due: Bool)? in
+                                debounceTask = nil
+                                guard let catchUp = pendingMessages, messagesContainStreamingText(catchUp) else {
+                                    return nil
+                                }
+                                let dueForMaxBatch = isDueForMaxBatch()
+                                if dueForMaxBatch {
+                                    pendingMessages = nil
+                                }
+                                return (catchUp, currentGeneration, dueForMaxBatch)
+                            }
+                            if let catchUpState {
+                                if catchUpState.due {
+                                    await publishPlainStreamingFrame(
+                                        generation: catchUpState.generation,
+                                        messages: catchUpState.messages
+                                    )
+                                } else {
+                                    scheduleStreamingPublish(generation: catchUpState.generation)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                func schedulePrepare(
+                    generation: UInt64,
+                    messages: [Message],
+                    reason: String,
+                    mode: MessagePreparationMode,
+                    onCommitted: (() -> Void)? = nil
+                ) {
+                    synced {
+                        prepareTask?.cancel()
+                        prepareTask = Task {
+                            let streaming = messagesContainStreamingText(messages)
+                            let streamingChars = streamingMessageCharCount(messages)
+                            let meta = synced { () -> (sinceLastPublishMs: Int, snapshot: [String: DisplayMessage]) in
+                                let sinceLastPublishMs: Int = {
+                                    guard let lastPublishedAt else { return -1 }
+                                    return Int((clock.now - lastPublishedAt) / .milliseconds(1))
+                                }()
+                                return (sinceLastPublishMs, previousByID)
+                            }
+                            let prepared = await contentPreparer.prepareMessages(
+                                messages,
+                                previousByID: meta.snapshot,
+                                mode: mode
+                            )
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            guard commitPrepared(
+                                generation: generation,
+                                prepared: prepared,
+                                mode: mode
+                            ) else { return }
+                            synced { lastPublishedMessages = messages }
+                            // Format-first history is publishable; do not hold Ready on
+                            // unprocessed plain while highlight-core enrichment catches up.
+                            OpenCodeLog.messageContent.info(
+                                "displayPublish reason=\(reason) streaming=\(streaming) chars=\(streamingChars) sinceLastMs=\(meta.sinceLastPublishMs) generation=\(generation)"
+                            )
+                            emitDisplayMessages(prepared)
+                            onCommitted?()
+                        }
+                    }
+                }
+
+                func schedulePlainFirstNewestFirst(
+                    generation: UInt64,
+                    messages: [Message],
+                    reason: String,
+                    onCommitted: (() -> Void)? = nil
+                ) {
+                    synced {
+                        prepareTask?.cancel()
+                        prepareTask = Task {
+                            let previousSnapshot = synced { previousByID }
+                            var byID = Dictionary(
+                                messages.map { message in
+                                    (
+                                        message.id,
+                                        previousSnapshot[message.id].flatMap { cached in
+                                            cached.text == message.text ? cached : nil
+                                        } ?? DisplayMessage(message: message, renderedMarkdown: nil)
+                                    )
+                                },
+                                uniquingKeysWith: { _, last in last }
+                            )
+
+                            func publish(label: String) {
+                                guard isCurrent(generation) else { return }
+                                let frame = messages.map { byID[$0.id]! }
+                                guard commitPrepared(
+                                    generation: generation,
+                                    prepared: frame,
+                                    mode: .historyPlainFirst
+                                ) else { return }
+                                synced {
+                                    lastPublishedMessages = messages
+                                    lastPublishedAt = clock.now
+                                }
+                                OpenCodeLog.messageContent.info(
+                                    "displayPublish reason=\(reason)-\(label) generation=\(generation)"
+                                )
+                                emitDisplayMessages(frame)
+                            }
+
+                        // Phase 1: newest markdown message only, then publish.
+                        if let newest = messages.reversed().first(where: {
+                            OpenCodeRenderedMarkdownDetector.shouldRender($0.text)
+                        }) {
+                            let prepared = await contentPreparer.prepareMessage(
+                                newest,
+                                previous: byID[newest.id],
+                                mode: .historyPlainFirst
+                            )
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            byID[newest.id] = prepared
+                            synced {
+                                previousByID[newest.id] = prepared
+                                preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                            }
+                            publish(label: "newest")
+                        }
+
+                        let phase2 = await contentPreparer.prepareMessages(
+                            messages,
+                            previousByID: byID,
+                            mode: .historyPlainFirst
+                        )
+                        guard !Task.isCancelled, isCurrent(generation) else { return }
+                        for display in phase2 {
+                            byID[display.id] = display
+                        }
+                        synced {
+                            previousByID = byID
+                            preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                        }
+                        publish(label: "rest")
+                        onCommitted?()
+                        }
+                    }
+                }
+
+                func scheduleFinalization(generation: UInt64, messages: [Message]) {
+                    synced {
+                        prepareTask?.cancel()
+                        prepareTask = Task {
+                            let snapshot = synced { previousByID }
+                            let placeholder = await contentPreparer.prepareMessages(
+                                messages,
+                                previousByID: snapshot,
+                                mode: .finalPlaceholder
+                            )
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            guard commitPrepared(
+                                generation: generation,
+                                prepared: placeholder,
+                                mode: .finalPlaceholder
+                            ) else { return }
+                            synced { lastPublishedMessages = messages }
+                            OpenCodeLog.messageContent.info(
+                                "displayPublish reason=final-placeholder generation=\(generation)"
+                            )
+                            emitDisplayMessages(placeholder)
+
+                            let finalized = await contentPreparer.prepareMessages(
+                                messages,
+                                // Use pre-placeholder snapshot so Final does not
+                                // settle-reuse streaming-quality spans via the
+                                // placeholder DisplayMessage (isStreaming=false).
+                                previousByID: snapshot,
+                                mode: .final
+                            )
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            guard commitPrepared(
+                                generation: generation,
+                                prepared: finalized,
+                                mode: .final
+                            ) else { return }
+                            synced { lastPublishedMessages = messages }
+                            OpenCodeLog.messageContent.info(
+                                "displayPublish reason=final generation=\(generation)"
+                            )
+                            emitDisplayMessages(finalized)
+                        }
+                    }
+                }
+
+                func enrichHistoryInBackground(generation: UInt64, messages: [Message]) {
+                    synced {
+                        enrichmentTask?.cancel()
+                        enrichmentTask = Task {
+                        let holdReady = MessageContentPreparer.holdReadyUntilNewestMarkdown
+                        await Task.yield()
+                        // Spinner is already up when holding Ready — start highlighting ASAP.
+                        if !holdReady {
+                            await clock.sleep(for: .milliseconds(48))
+                        }
+                        guard !Task.isCancelled, isCurrent(generation) else { return }
+
+                        let previousSnapshot = synced { previousByID }
+                        var byID = Dictionary(
+                            messages.map { message in
+                                (
+                                    message.id,
+                                    previousSnapshot[message.id].flatMap { cached in
+                                        cached.text == message.text ? cached : nil
+                                    } ?? DisplayMessage(message: message, renderedMarkdown: nil)
+                                )
+                            },
+                            uniquingKeysWith: { _, last in last }
+                        )
+                        var enrichedCount = 0
+                        var viewportEnrichedCount = 0
+                        var viewportCharactersRemaining =
+                            MessageContentPreparer.historyEnrichViewportCharacterBudget
+                        var publishedViewport = false
+
+                        func publishSnapshot(reason: String, count: Int) {
+                            guard isCurrent(generation) else { return }
+                            let snapshot = messages.map { byID[$0.id]! }
+                            synced {
+                                previousByID = Dictionary(
+                                    snapshot.map { ($0.id, $0) },
+                                    uniquingKeysWith: { _, last in last }
+                                )
+                                preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                                lastPublishedMessages = messages
+                                lastPublishedAt = clock.now
+                            }
+                            OpenCodeLog.messageContent.info(
+                                "displayPublish reason=\(reason) count=\(count) generation=\(generation)"
+                            )
+                            emitDisplayMessages(snapshot)
+                        }
+
+                        for message in messages.reversed() {
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            guard OpenCodeRenderedMarkdownDetector.shouldRender(message.text) else { continue }
+                            if let cached = byID[message.id],
+                               cached.renderedMarkdown != nil,
+                               cached.text == message.text,
+                               cached.awaitingTextMateUpgrade != true {
+                                continue
+                            }
+
+                            let prepared = await contentPreparer.prepareMessage(
+                                message,
+                                previous: byID[message.id],
+                                mode: .historyEnrichment
+                            )
+                            guard !Task.isCancelled, isCurrent(generation) else { return }
+                            byID[message.id] = prepared
+                            synced {
+                                previousByID[message.id] = prepared
+                                preparedHistoryCache.setMessages(previousByID, for: cacheKey)
+                            }
+                            enrichedCount += 1
+
+                            if !publishedViewport {
+                                viewportEnrichedCount += 1
+                                viewportCharactersRemaining -= message.text.count
+                                let viewportReady =
+                                    holdReady
+                                    || viewportEnrichedCount
+                                    >= MessageContentPreparer.historyEnrichViewportMessageCount
+                                    || viewportCharactersRemaining <= 0
+                                if viewportReady {
+                                    publishSnapshot(
+                                        reason: holdReady ? "enrich-newest" : "enrich-viewport",
+                                        count: viewportEnrichedCount
+                                    )
+                                    publishedViewport = true
+                                }
+                            }
+                        }
+                        guard !Task.isCancelled, isCurrent(generation) else { return }
+                        // Escape hatch: hold path must not leave the UI on Loading forever.
+                        if holdReady, !publishedViewport {
+                            publishSnapshot(reason: "enrich-escape", count: 0)
+                            return
+                        }
+                        guard enrichedCount > 0 else { return }
+                        if !publishedViewport {
+                            publishSnapshot(reason: "enrich-batch", count: enrichedCount)
+                        } else if enrichedCount > viewportEnrichedCount {
+                            publishSnapshot(
+                                reason: "enrich-batch",
+                                count: enrichedCount - viewportEnrichedCount
+                            )
+                        }
+                        OpenCodeLog.messageContent.info(
+                            "historyEnrich finished count=\(enrichedCount) viewport=\(viewportEnrichedCount) generation=\(generation)"
+                        )
+                        }
+                    }
+                }
+
+                for await update in snapshotSource.observeMessages(sessionID: sessionID, directory: directory) {
+                    switch update {
+                    case .loadFailed(let error):
+                        _ = nextGeneration()
+                        invalidateInFlightWork()
+                        synced {
+                            pendingMessages = nil
+                            lastPublishedMessages = nil
+                            isStreamingSession = false
+                            streamingDocs.removeAll()
+                        }
+                        continuation.yield(.loadFailed(error))
+                    case .messages(let messages, let isFromCache):
+                        if !messagesContainStreamingText(messages) {
+                            let noop = synced { () -> (skip: Bool, confirmsCache: Bool) in
+                                guard !isFromCache,
+                                      lastPublishedMessages == messages,
+                                      !isStreamingSession
+                                else { return (false, false) }
+                                // A network frame identical to the cache-seeded one confirms the
+                                // cache. Skipping it silently left Syncing… up (e.g. a compacted
+                                // v2 tail never passes the settled tail-identity confirm).
+                                let confirmsCache = sourceIsFromCache
+                                sourceIsFromCache = false
+                                return (true, confirmsCache)
+                            }
+                            if noop.skip {
+                                if noop.confirmsCache { continuation.yield(.cacheSyncConfirmed) }
+                                continue
+                            }
+                        }
+                        let plan = synced { () -> (
+                            generation: UInt64,
+                            dueForMaxBatch: Bool,
+                            latest: [Message]?,
+                            scheduleStreaming: Bool,
+                            hadStreamingPrevious: Bool,
+                            hasCompleteMarkdownCache: Bool,
+                            sourceIsFromCache: Bool,
+                            previousByID: [String: DisplayMessage]
+                        ) in
+                            sourceIsFromCache = isFromCache
+                            streamingDocs = streamingDocumentsStillStreaming(streamingDocs, in: messages)
+                            if messagesContainStreamingText(messages) {
+                                // Coalesce streaming tokens into `pendingMessages`. Do not bump
+                                // generation on every delta — prepare stays generation-gated
+                                // and rejects on text-identity mismatch within the session.
+                                if !isStreamingSession {
+                                    isStreamingSession = true
+                                    currentGeneration &+= 1
+                                    debounceTask?.cancel()
+                                    debounceTask = nil
+                                    prepareTask?.cancel()
+                                    prepareTask = nil
+                                    enrichmentTask?.cancel()
+                                    enrichmentTask = nil
+                                } else {
+                                    enrichmentTask?.cancel()
+                                    enrichmentTask = nil
+                                    // Keep the open coalesce window. Later deltas replace
+                                    // pendingMessages instead of restarting the quiet timer.
+                                }
+                                pendingMessages = messages
+                                let dueForMaxBatch = isDueForMaxBatch()
+                                let latest: [Message]?
+                                if dueForMaxBatch {
+                                    debounceTask?.cancel()
+                                    debounceTask = nil
+                                    latest = pendingMessages ?? messages
+                                    pendingMessages = nil
+                                } else {
+                                    latest = nil
+                                }
+                                return (
+                                    currentGeneration,
+                                    dueForMaxBatch,
+                                    latest,
+                                    !dueForMaxBatch,
+                                    false,
+                                    false,
+                                    isFromCache,
+                                    previousByID
+                                )
+                            } else {
+                                currentGeneration &+= 1
+                                let generation = currentGeneration
+                                debounceTask?.cancel()
+                                debounceTask = nil
+                                prepareTask?.cancel()
+                                prepareTask = nil
+                                enrichmentTask?.cancel()
+                                enrichmentTask = nil
+                                pendingMessages = nil
+                                isStreamingSession = false
+                                return (
+                                    generation,
+                                    false,
+                                    nil,
+                                    false,
+                                    previousByID.values.contains(where: \.isStreaming),
+                                    hasCompletePreparedMarkdownCache(
+                                        messages: messages,
+                                        previousByID: previousByID
+                                    ),
+                                    isFromCache,
+                                    previousByID
+                                )
+                            }
+                        }
+                        if messagesContainStreamingText(messages) {
+                            if plan.dueForMaxBatch, let latest = plan.latest {
+                                await publishPlainStreamingFrame(generation: plan.generation, messages: latest)
+                            } else if plan.scheduleStreaming {
+                                scheduleStreamingPublish(generation: plan.generation)
+                            }
+                        } else if plan.hadStreamingPrevious {
+                            scheduleFinalization(generation: plan.generation, messages: messages)
+                        } else if plan.hasCompleteMarkdownCache {
+                            schedulePrepare(
+                                generation: plan.generation,
+                                messages: messages,
+                                reason: "cache-hit",
+                                mode: .final
+                            )
+                        } else if plan.sourceIsFromCache ||
+                            shouldPlainFirstHistoryPublish(
+                                messages: messages,
+                                previousByID: plan.previousByID
+                            )
+                        {
+                            schedulePlainFirstNewestFirst(
+                                generation: plan.generation,
+                                messages: messages,
+                                reason: plan.sourceIsFromCache ? "cache-seed-plain-first" : "plain-first",
+                                onCommitted: {
+                                    guard isCurrent(plan.generation) else { return }
+                                    enrichHistoryInBackground(
+                                        generation: plan.generation,
+                                        messages: messages
+                                    )
+                                }
+                            )
+                        } else {
+                            schedulePrepare(
+                                generation: plan.generation,
+                                messages: messages,
+                                reason: "final",
+                                mode: .final
+                            )
+                        }
+                    case .cacheSyncConfirmed:
+                        // Network agreed with the cache. Clear the flag so in-flight
+                        // plain-first / enrichment publishes cannot re-raise Syncing.
+                        synced { sourceIsFromCache = false }
+                        continuation.yield(.cacheSyncConfirmed)
+                    }
+                }
+
+                // Teardown cancels and drops unpublished work. No flush contract.
+                invalidateInFlightWork()
+                synced { pendingMessages = nil }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    func refreshDisplayMessages(sessionID: String, directory: String?) async throws -> [DisplayMessage] {
+        guard let messageSync else {
+            preconditionFailure("refreshDisplayMessages requires a MessageSync-backed pipeline")
+        }
+        let messages = try await messageSync.refreshMessages(sessionID: sessionID, directory: directory)
+        return await contentPreparer.prepareMessages(
+            messages,
+            previousByID: [:],
+            mode: .final
+        )
+    }
+}
+
+nonisolated func shouldPlainFirstHistoryPublish(
+    messages: [Message],
+    previousByID: [String: DisplayMessage]
+) -> Bool {
+    // Complete warm cache should take the cache-hit path instead.
+    if hasCompletePreparedMarkdownCache(messages: messages, previousByID: previousByID) {
+        return false
+    }
+    var markdownChars = 0
+    for message in messages {
+        guard OpenCodeRenderedMarkdownDetector.shouldRender(message.text) else { continue }
+        markdownChars += message.text.count
+        if markdownChars >= MessageContentPreparer.historyPlainFirstMarkdownCharacterThreshold {
+            return true
+        }
+    }
+    return false
+}
+
+/// Newest markdown-bearing message ids for the open viewport (bottom of chat).
+nonisolated func newestMarkdownViewportIDs(
+    messages: [Message],
+    maxCount: Int = MessageContentPreparer.historyEnrichViewportMessageCount,
+    charBudget: Int = MessageContentPreparer.historyEnrichViewportCharacterBudget
+) -> Set<String> {
+    guard !messages.isEmpty, maxCount > 0 else { return [] }
+    var ids = Set<String>()
+    var remainingChars = charBudget
+    for message in messages.reversed() {
+        guard OpenCodeRenderedMarkdownDetector.shouldRender(message.text) else { continue }
+        ids.insert(message.id)
+        remainingChars -= message.text.count
+        if ids.count >= maxCount || remainingChars <= 0 { break }
+    }
+    return ids
+}
+
+nonisolated func hasCompletePreparedMarkdownCache(
+    messages: [Message],
+    previousByID: [String: DisplayMessage]
+) -> Bool {
+    var sawMarkdownCandidate = false
+    for message in messages {
+        guard OpenCodeRenderedMarkdownDetector.shouldRender(message.text) else { continue }
+        sawMarkdownCandidate = true
+        guard let cached = previousByID[message.id],
+              cached.renderedMarkdown != nil,
+              cached.text == message.text
+        else {
+            return false
+        }
+    }
+    return sawMarkdownCandidate
+}
+
+nonisolated private func messagesContainStreamingText(_ messages: [Message]) -> Bool {
+    messages.contains(where: messageHasStreamingText)
+}
+
+/// The live streaming documents of the messages still streaming in `messages`: an entry goes
+/// once its message finalizes or leaves the list.
+nonisolated func streamingDocumentsStillStreaming(
+    _ documents: [String: NativeMarkdownDocument],
+    in messages: [Message]
+) -> [String: NativeMarkdownDocument] {
+    guard !documents.isEmpty else { return documents }
+    let streamingIDs = Set(messages.lazy.filter(messageHasStreamingText).map(\.id))
+    return documents.filter { streamingIDs.contains($0.key) }
+}
+
+nonisolated private func messageHasStreamingText(_ message: Message) -> Bool {
+    message.parts.contains { part in
+        if case .text(let textPart) = part {
+            return textPart.isStreaming
+        }
+        return false
+    }
+}
+
+nonisolated private func streamingMessageCharCount(_ messages: [Message]) -> Int {
+    messages.reduce(0) { partial, message in
+        guard messageHasStreamingText(message) else { return partial }
+        return max(partial, message.text.count)
+    }
+}
+
+extension NativeMarkdownDocument {
+    /// Copies stable fence colors onto a newly parsed structure so a growing stream does not flash plain.
+    func carryingCodeSpans(from previous: NativeMarkdownDocument?) -> NativeMarkdownDocument {
+        guard let previous else { return self }
+        let oldFences = previous.blocks.compactMap { block -> (code: String, spans: [NativeCodeSpan])? in
+            guard case .codeBlock(_, let code, let spans) = block else { return nil }
+            return (code, spans)
+        }
+        guard !oldFences.isEmpty else { return self }
+        var fence = 0
+        var changed = false
+        let updated = blocks.map { block -> NativeMarkdownBlock in
+            guard case .codeBlock(let language, let code, let spans) = block else { return block }
+            guard fence < oldFences.count else { return block }
+            let old = oldFences[fence]
+            fence += 1
+            let carried = carryCodeSpans(oldCode: old.code, oldSpans: old.spans, newCode: code)
+            guard !carried.isEmpty, carried != spans else { return block }
+            changed = true
+            return .codeBlock(language: language, code: code, spans: carried)
+        }
+        guard changed else { return self }
+        return NativeMarkdownDocument(
+            renderTreeVersion: renderTreeVersion,
+            sourceHash: sourceHash,
+            blocks: updated,
+            diagnostics: diagnostics
+        )
+    }
+
+    func hasCodeFence() -> Bool {
+        blocks.contains { block in
+            if case .codeBlock = block { return true }
+            return false
+        }
+    }
+
+    func hasUncoloredCodeFence() -> Bool {
+        blocks.contains { block in
+            guard case .codeBlock(_, let code, let spans) = block else { return false }
+            return spans.isEmpty && !code.isEmpty
+        }
+    }
+
+    func hasSameCodeSpans(as other: NativeMarkdownDocument) -> Bool {
+        let left = blocks.compactMap { block -> (String, [NativeCodeSpan])? in
+            guard case .codeBlock(_, let code, let spans) = block else { return nil }
+            return (code, spans)
+        }
+        let right = other.blocks.compactMap { block -> (String, [NativeCodeSpan])? in
+            guard case .codeBlock(_, let code, let spans) = block else { return nil }
+            return (code, spans)
+        }
+        guard left.count == right.count else { return false }
+        return zip(left, right).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+    }
+}
+
+private func carryCodeSpans(
+    oldCode: String,
+    oldSpans: [NativeCodeSpan],
+    newCode: String
+) -> [NativeCodeSpan] {
+    guard !oldSpans.isEmpty else { return [] }
+    if newCode == oldCode { return oldSpans }
+    guard newCode.hasPrefix(oldCode) else { return [] }
+    let limit = oldCode.utf16.count
+    return oldSpans.filter { $0.start >= 0 && $0.end <= limit && $0.start < $0.end }
+}

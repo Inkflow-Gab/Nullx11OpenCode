@@ -1,0 +1,1144 @@
+import Foundation
+
+nonisolated struct MessageDomainAdapter: Sendable {
+    /// Receive time for a failure whose message has no completed time yet.
+    var nowEpochMs: @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1_000) }
+
+    func message(from dto: MessageDTO) -> Message {
+        let info = dto.info
+        let domainParts = parseParts(from: dto.parts)
+        let flatText = displayText(from: domainParts)
+        let stop = stopReason(info)
+        return Message(
+            id: info.id,
+            role: role(from: info.role),
+            text: flatText,
+            parts: domainParts,
+            cost: info.cost,
+            tokens: tokenUsage(from: info.tokens),
+            model: info.model?.modelID ?? info.modelID,
+            modelProviderID: info.model?.providerID ?? info.providerID,
+            modelID: info.model?.modelID ?? info.modelID,
+            variant: info.variant,
+            mode: info.mode ?? info.agent,
+            sentAtEpochMs: info.time?.created,
+            completedAtEpochMs: info.time?.completed,
+            contextInputTokens: info.tokens?.input,
+            contextEstimate: contextEstimate(role: info.role, parts: dto.parts),
+            followUpDelivery: FollowUpDelivery.fromWire(info.delivery),
+            isWaitingForPickup: info.waiting == true,
+            stopReason: stop,
+            failure: sessionFailure(info.error, stopReason: stop, completedAtEpochMs: info.time?.completed)
+        )
+    }
+
+    func message(
+        info: MessageInfoDTO,
+        domainParts: [MessagePart]
+    ) -> Message {
+        let flatText = displayText(from: domainParts)
+        let stop = stopReason(info)
+        return Message(
+            id: info.id,
+            role: role(from: info.role),
+            text: flatText,
+            parts: domainParts,
+            cost: info.cost,
+            tokens: tokenUsage(from: info.tokens),
+            model: info.model?.modelID ?? info.modelID,
+            modelProviderID: info.model?.providerID ?? info.providerID,
+            modelID: info.model?.modelID ?? info.modelID,
+            variant: info.variant,
+            mode: info.mode ?? info.agent,
+            sentAtEpochMs: info.time?.created,
+            completedAtEpochMs: info.time?.completed,
+            contextInputTokens: info.tokens?.input,
+            contextEstimate: MessageContextEstimate(),
+            followUpDelivery: FollowUpDelivery.fromWire(info.delivery),
+            isWaitingForPickup: info.waiting == true,
+            stopReason: stop,
+            failure: sessionFailure(info.error, stopReason: stop, completedAtEpochMs: info.time?.completed),
+            promptSkills: promptSkills(info.skills ?? [])
+        )
+    }
+
+    func messagePart(from dto: MessagePartDTO) -> MessagePart? {
+        switch dto.type {
+        case "text":
+            guard let text = dto.text else { return nil }
+            return .text(
+                TextPart(
+                    id: dto.id,
+                    text: text,
+                    isStreaming: false,
+                    isSynthetic: dto.synthetic == true,
+                    isIgnored: dto.ignored == true
+                )
+            )
+        case "file":
+            return filePart(from: dto)
+        case "tool":
+            let toolName = ToolPartIdentity.resolvedName(explicit: dto.tool ?? dto.name, input: dto.state?.input)
+            return .tool(toolPart(id: dto.id, toolName: toolName, callID: dto.callID, state: dto.state))
+        case "compaction":
+            return .compaction(
+                CompactionPart(
+                    id: dto.id,
+                    auto: dto.auto == true,
+                    completed: dto.completed == true,
+                    summary: dto.summary.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                )
+            )
+        case "reasoning":
+            return .reasoning(
+                ReasoningPart(
+                    id: dto.id,
+                    text: dto.text ?? "",
+                    isStreaming: false,
+                    timeStartEpochMs: dto.time?.start,
+                    timeEndEpochMs: dto.time?.end
+                )
+            )
+        case "notice":
+            guard let id = dto.id ?? dto.messageID, let notice = dto.notice else { return nil }
+            return timelineNotice(id: id, from: notice).map(MessagePart.notice)
+        default:
+            return nil
+        }
+    }
+
+    /// The product notice for a v2 notice item, or nil when the item draws no row
+    /// (an unknown type, a switch without its value, or a non-restart synthetic).
+    func timelineNotice(id: String, from dto: V2NoticeDTO) -> TimelineNotice? {
+        let kind: TimelineNoticeKind?
+        switch dto.type {
+        case "location-switched":
+            kind = Self.nonBlank(dto.location?.directory).map { TimelineNoticeKind.moved(directory: $0) }
+        case "agent-switched":
+            kind = Self.nonBlank(dto.agent).map { agent in
+                let previous = Self.nonBlank(dto.previous?.agent)
+                return .agentChanged(agent: agent, previous: previous == agent ? nil : previous)
+            }
+        case "model-switched":
+            kind = Self.noticeModel(dto.model).map { model in
+                .modelChanged(model: model, previous: Self.noticeModel(dto.previous?.model))
+            }
+        case "system":
+            kind = Self.systemNotice(metadata: dto.metadata, description: dto.description)
+        case "synthetic":
+            kind = Self.isRestartNotice(metadata: dto.metadata, description: dto.description) ? .restart : nil
+        default:
+            kind = nil
+        }
+        return kind.map { TimelineNotice(id: id, kind: $0) }
+    }
+
+    static let instructionsDescriptionPrefix = "Instructions updated: "
+    static let restartDescription = "Continuing after restart"
+
+    /// Instruction updates name their sources in metadata, or in the description
+    /// older servers wrote. Other system items show their description only: `text`
+    /// is the model-facing update.
+    private static func systemNotice(metadata: [String: AnyCodable]?, description: String?) -> TimelineNoticeKind {
+        if case .string("instructions")? = metadata?["notice"],
+           case .array(let values)? = metadata?["instructionSources"]
+        {
+            let sources = values.compactMap { value -> String? in
+                if case .string(let source) = value { return nonBlank(source) }
+                return nil
+            }
+            if !sources.isEmpty { return .instructionsUpdated(sources: sources) }
+        }
+        if let description, description.hasPrefix(instructionsDescriptionPrefix) {
+            let sources = description.dropFirst(instructionsDescriptionPrefix.count)
+                .split(separator: ",")
+                .compactMap { nonBlank(String($0)) }
+            return .instructionsUpdated(sources: sources)
+        }
+        if let description = nonBlank(description) { return .systemNote(description) }
+        return .instructionsUpdated(sources: [])
+    }
+
+    private static func isRestartNotice(metadata: [String: AnyCodable]?, description: String?) -> Bool {
+        if case .string("restart")? = metadata?["notice"] { return true }
+        return description == restartDescription
+    }
+
+    private static func noticeModel(_ dto: V2ModelRefDTO?) -> TimelineNoticeModel? {
+        guard let modelID = nonBlank(dto?.id) else { return nil }
+        return TimelineNoticeModel(
+            providerID: nonBlank(dto?.providerID),
+            modelID: modelID,
+            variant: nonBlank(dto?.variant)
+        )
+    }
+
+    private static func nonBlank(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
+    func toolPart(
+        id: String? = nil,
+        toolName: String,
+        callID: String? = nil,
+        state: MessageToolStateDTO?
+    ) -> ToolPart {
+        let status = toolStatus(from: state?.status)
+        return ToolPart(
+            id: id,
+            toolName: toolName,
+            status: status,
+            title: state?.title.flatMap { $0.isEmpty ? nil : $0 },
+            error: state?.error.flatMap { $0.isEmpty ? nil : $0 },
+            callID: callID,
+            input: state?.input,
+            output: state?.output,
+            metadata: state?.metadata,
+            timeStartEpochMs: state?.time?.start,
+            isInterrupted: status == .error
+                && (state?.interrupted == true || ToolInterruption.isUserInterruption(state?.error)),
+            isMalformed: state?.malformed == true,
+            images: toolImages(state?.attachments, ownerID: id ?? callID)
+        )
+    }
+
+    /// v1 tool `attachments` (and v2 live `content` files projected into the same shape) that
+    /// the timeline can show as images.
+    private func toolImages(_ attachments: [MessageToolAttachmentDTO]?, ownerID: String?) -> [FilePart] {
+        guard let attachments, !attachments.isEmpty else { return [] }
+        return attachments.enumerated().compactMap { index, attachment in
+            toolImage(
+                id: attachment.id?.nilIfEmpty ?? Self.toolImageID(ownerID: ownerID, index: index),
+                filename: attachment.filename,
+                mime: attachment.mime,
+                url: attachment.url
+            )
+        }
+    }
+
+    /// Id for a tool-returned file that carries none (v2 content items): the tool part id and
+    /// the file's position, so a live result and its REST copy agree.
+    static func toolImageID(ownerID: String?, index: Int) -> String {
+        "\(ownerID ?? "tool"):file:\(index)"
+    }
+
+    /// A tool-returned file kept only when it is an image the app can show, carried as a data URL.
+    /// The file name stays empty when the tool gave none.
+    private func toolImage(id: String, filename: String?, mime: String?, url: String?) -> FilePart? {
+        let dataURL = url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !dataURL.isEmpty,
+              case .file(let file)? = resolvedFilePart(id: id, filename: filename, mime: mime, dataURL: dataURL),
+              file.kind == .image
+        else { return nil }
+        return FilePart(
+            id: file.id,
+            filename: filename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            mime: file.mime,
+            kind: file.kind,
+            dataURL: file.dataURL
+        )
+    }
+
+    func toolStatus(from raw: String?) -> ToolStatus {
+        switch raw {
+        case "pending", "streaming":
+            .pending
+        case "running":
+            .running
+        case "completed":
+            .completed
+        case "error":
+            .error
+        default:
+            .pending
+        }
+    }
+
+    func compactToolLabel(for tool: ToolPart) -> String {
+        switch tool.status {
+        case .pending:
+            return "⌛ \(tool.toolName)"
+        case .running:
+            if let title = tool.title, !title.isEmpty {
+                return "⏳ \(title)"
+            }
+            return "⏳ \(tool.toolName)"
+        case .completed:
+            return "✓ \(tool.toolName)"
+        case .error:
+            let message = tool.error.flatMap { $0.isEmpty ? nil : $0 } ?? "failed"
+            return "✕ \(tool.toolName): \(message)"
+        }
+    }
+
+    func flattenedText(from parts: [MessagePart]) -> String {
+        displayText(from: parts)
+    }
+
+    func sendRequest(text: String) -> SendMessageRequestDTO {
+        SendMessageRequestDTO(parts: [SendMessagePartDTO(type: "text", text: text)])
+    }
+
+    func sendRequest(options: PromptSendOptions) -> SendMessageRequestDTO {
+        var parts: [SendMessagePartDTO] = []
+        let text = UploadedAttachmentMetadata.promptText(options.text, uploaded: options.uploadedAttachments)
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(SendMessagePartDTO(type: "text", text: text))
+        }
+        parts.append(contentsOf: ComposerMentionRouting.agentParts(text: options.text, mentions: options.agentMentions).map { part in
+            SendMessagePartDTO(
+                type: "agent",
+                name: part.name,
+                source: AgentPartSourceDTO(value: part.sourceValue, start: part.start, end: part.end)
+            )
+        })
+        parts.append(contentsOf: fileReferenceParts(options))
+        // Omit wire `id`: FilePartInput allows it only when it matches ^prt.
+        // Local Attachment ids are UUIDs for composer chip identity.
+        parts.append(contentsOf: options.inlineAttachments.map {
+            SendMessagePartDTO(type: "file", mime: $0.mime, filename: $0.filename, url: $0.dataURL)
+        })
+        return SendMessageRequestDTO(
+            parts: parts,
+            model: options.model.map { SendPromptModelDTO(providerID: $0.providerID, modelID: $0.modelID) },
+            variant: options.variant,
+            agent: options.mode,
+            messageID: options.messageID
+        )
+    }
+
+    func v1ShellRequest(options: ShellCommandOptions) -> V1ShellRequestDTO {
+        V1ShellRequestDTO(
+            agent: options.agent,
+            command: options.command,
+            model: options.model.map { SendPromptModelDTO(providerID: $0.providerID, modelID: $0.modelID) }
+        )
+    }
+
+    func v2ShellRequest(options: ShellCommandOptions) -> V2ShellRequestDTO {
+        V2ShellRequestDTO(command: options.command)
+    }
+
+    func v2PromptRequest(options: PromptSendOptions) -> V2PromptRequestDTO {
+        let files = options.inlineAttachments.map {
+            V2PromptFileDTO(uri: $0.dataURL, name: $0.filename, mime: $0.mime)
+        }
+        let uploaded = options.uploadedAttachments
+        let metadata = uploaded.isEmpty ? nil : V2PromptMetadataDTO(
+            attachments: uploaded.compactMap { attachment in
+                attachment.uploadedServerPath.map {
+                    V2PromptUploadedAttachmentDTO(name: attachment.filename, mime: attachment.mime, path: $0)
+                }
+            }
+        )
+        let agents = ComposerMentionRouting.agentParts(text: options.text, mentions: options.agentMentions).map { part in
+            V2PromptAgentDTO(
+                name: part.name,
+                mention: V2PromptSourceDTO(start: part.start, end: part.end, text: part.sourceValue)
+            )
+        }
+        let skills = ComposerMentionRouting.skillParts(text: options.text, mentions: options.skillMentions).map { part in
+            V2PromptSkillDTO(
+                id: part.skillID,
+                mention: V2PromptSourceDTO(start: part.start, end: part.end, text: part.sourceValue)
+            )
+        }
+        return V2PromptRequestDTO(
+            id: options.messageID,
+            text: UploadedAttachmentMetadata.promptText(options.text, uploaded: uploaded),
+            files: files.isEmpty ? nil : files,
+            agents: agents.isEmpty ? nil : agents,
+            skills: skills.isEmpty ? nil : skills,
+            delivery: options.delivery.wireValue,
+            fileMentions: v2FileMentions(options),
+            metadata: metadata
+        )
+    }
+
+    private func fileReferenceParts(_ options: PromptSendOptions) -> [SendMessagePartDTO] {
+        guard let worktree = options.worktree else { return [] }
+        return ComposerMentionRouting.fileParts(text: options.text, mentions: options.fileMentions).map { part in
+            SendMessagePartDTO(
+                type: "file",
+                mime: "text/plain",
+                filename: part.filename,
+                url: ProjectPaths.fileURL(worktree: worktree, relativePath: part.path),
+                fileSource: FileReferenceSourceDTO(
+                    path: part.path,
+                    value: part.sourceValue,
+                    start: part.start,
+                    end: part.end
+                )
+            )
+        }
+    }
+
+    private func v2FileMentions(_ options: PromptSendOptions) -> [V2PromptFileMentionDTO]? {
+        guard let worktree = options.worktree else { return nil }
+        let mentions = ComposerMentionRouting.fileParts(text: options.text, mentions: options.fileMentions).map { part in
+            V2PromptFileMentionDTO(
+                uri: ProjectPaths.fileURL(worktree: worktree, relativePath: part.path),
+                name: part.filename,
+                mention: V2PromptSourceDTO(start: part.start, end: part.end, text: part.sourceValue)
+            )
+        }
+        return mentions.isEmpty ? nil : mentions
+    }
+
+    func v2SwitchModelRequest(options: PromptSendOptions) -> V2SwitchModelRequestDTO? {
+        guard let model = options.model else { return nil }
+        return V2SwitchModelRequestDTO(
+            model: V2PromptModelRefDTO(id: model.modelID, providerID: model.providerID, variant: options.variant)
+        )
+    }
+
+    func mapError(_ error: Error) -> MessageError {
+        if let messageError = error as? MessageError {
+            return messageError
+        }
+        if let apiError = error as? MessagesAPIError {
+            switch apiError {
+            case .invalidResponse, .noActiveConnection:
+                return .transport("Invalid response")
+            case let .httpStatus(code, message):
+                return .http(statusCode: code, message: httpMessage(message))
+            }
+        }
+        if error is DecodingError {
+            return .decoding(error.localizedDescription)
+        }
+        return .transport(TransportFailure.captured(from: error))
+    }
+
+    // MARK: Part parsing
+
+    func parseParts(from dtos: [MessagePartDTO]) -> [MessagePart] {
+        dtos.compactMap { messagePart(from: $0) }
+    }
+
+    func messages(fromV2 dtos: [V2SessionMessageDTO]) -> [Message] {
+        var messages: [Message] = []
+        var agent = ""
+        var model: V2ModelRefDTO?
+        for dto in dtos {
+            switch dto.type {
+            case "agent-switched", "location-switched":
+                agent = dto.agent ?? agent
+                appendV2Notice(dto, to: &messages)
+            case "model-switched":
+                model = dto.model
+                appendV2Notice(dto, to: &messages)
+            case "system":
+                appendV2Notice(dto, to: &messages)
+            case "user":
+                messages.append(projectV2User(dto, agent: agent, model: model))
+                agent = dto.agent ?? agent
+                model = dto.model ?? model
+            case "synthetic":
+                if appendV2Notice(dto, to: &messages) { break }
+                if let synthetic = projectV2Synthetic(dto, agent: agent, model: model) {
+                    messages.append(synthetic)
+                }
+            case "skill":
+                messages.append(projectV2Skill(dto, agent: agent, model: model))
+            case "shell":
+                messages.append(contentsOf: projectV2Shell(dto, agent: agent, model: model))
+            case "assistant":
+                agent = dto.agent ?? agent
+                model = dto.model ?? model
+                messages.append(projectV2Assistant(dto, agent: agent, model: model))
+            case "compaction":
+                messages.append(projectV2Compaction(dto))
+            case "idle":
+                projectV2Idle(dto, messages: &messages)
+            default:
+                break
+            }
+        }
+        return messages
+    }
+
+    func mergeInbox(messages: [Message], inbox: [V2InboxItemDTO]) -> [Message] {
+        if inbox.isEmpty { return messages }
+        let userItems = inbox
+            .filter { $0.type == "user" }
+            .sorted { $0.timeCreated < $1.timeCreated }
+        if userItems.isEmpty { return messages }
+        let existingIDs = Set(messages.map(\.id))
+        let itemsByID = Dictionary(userItems.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        let merged = messages.map { message -> Message in
+            guard let item = itemsByID[message.id] else { return message }
+            return message.withPickupState(
+                isWaitingForPickup: true,
+                followUpDelivery: FollowUpDelivery.fromWire(item.delivery)
+            )
+        }
+        // Inbox items carry no agent or model; the server records the session's current
+        // ones on delivery, so inherit them from the newest message that has them.
+        let context = messages.last { $0.model != nil && $0.mode != "compaction" }
+        let materialized = userItems
+            .filter { !existingIDs.contains($0.id) }
+            .map { item -> Message in
+                let text = item.payload?.text ?? ""
+                return Message(
+                    id: item.id,
+                    role: .user,
+                    text: text,
+                    parts: text.isEmpty
+                        ? []
+                        : [.text(TextPart(id: "\(item.id):text:0", text: text, isStreaming: false))],
+                    model: context?.model,
+                    modelProviderID: context?.modelProviderID,
+                    modelID: context?.modelID,
+                    variant: context?.variant,
+                    mode: context?.mode,
+                    sentAtEpochMs: item.timeCreated,
+                    followUpDelivery: FollowUpDelivery.fromWire(item.delivery),
+                    isWaitingForPickup: true
+                )
+            }
+        return materialized.isEmpty ? merged : merged + materialized
+    }
+
+    // MARK: Private
+
+    /// A notice is its own row: no agent, model or context estimate, so it never
+    /// reads as a prompt or reply and never moves the running context.
+    @discardableResult
+    private func appendV2Notice(_ dto: V2SessionMessageDTO, to messages: inout [Message]) -> Bool {
+        guard let notice = timelineNotice(id: dto.id, from: dto.notice) else { return false }
+        messages.append(
+            messageFromV2(
+                id: dto.id,
+                role: .notice,
+                parts: [.notice(notice)],
+                sentAtEpochMs: dto.time?.created,
+                completedAtEpochMs: dto.time?.created
+            )
+        )
+        return true
+    }
+
+    private func projectV2User(_ dto: V2SessionMessageDTO, agent: String, model: V2ModelRefDTO?) -> Message {
+        var parts: [MessagePart] = []
+        let uploaded = UploadedAttachmentMetadata.refs(from: dto.metadata)
+        let text = UploadedAttachmentMetadata.displayText(dto.text ?? "", hiding: uploaded)
+        if !text.isEmpty {
+            parts.append(.text(TextPart(id: "\(dto.id):text:0", text: text, isStreaming: false)))
+        }
+        for (index, file) in dto.files.enumerated() {
+            if let part = v2FilePart(file, fallbackID: "\(dto.id):file:\(index)") {
+                parts.append(part)
+            }
+        }
+        parts.append(contentsOf: UploadedAttachmentMetadata.fileParts(uploaded, messageID: dto.id))
+        return messageFromV2(
+            id: dto.id,
+            role: .user,
+            parts: parts,
+            promptSkills: promptSkills(dto.skills),
+            mode: dto.agent ?? (agent.isEmpty ? nil : agent),
+            model: dto.model ?? model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextEstimate: MessageContextEstimate(
+                userCharacters: text.count
+                    + dto.files.reduce(0) { $0 + ($1.mention?.text?.count ?? $1.source?.text?.count ?? 0) }
+                    + dto.agents.reduce(0) { $0 + ($1.mention?.text?.count ?? $1.source?.text?.count ?? 0) }
+                    + dto.skills.reduce(0) { $0 + ($1.mention?.text?.count ?? 0) }
+            )
+        )
+    }
+
+    private func projectV2Synthetic(_ dto: V2SessionMessageDTO, agent: String, model: V2ModelRefDTO?) -> Message? {
+        let text = dto.description?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            ?? dto.text?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        guard let text else { return nil }
+        return messageFromV2(
+            id: dto.id,
+            role: .user,
+            parts: [.text(TextPart(id: "\(dto.id):text:0", text: text, isStreaming: false, isSynthetic: true))],
+            mode: agent.isEmpty ? nil : agent,
+            model: model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextEstimate: MessageContextEstimate(userCharacters: text.count)
+        )
+    }
+
+    private func projectV2Skill(_ dto: V2SessionMessageDTO, agent: String, model: V2ModelRefDTO?) -> Message {
+        let text = dto.text ?? ""
+        return messageFromV2(
+            id: dto.id,
+            role: .user,
+            parts: text.isEmpty ? [] : [.text(TextPart(id: "\(dto.id):text:0", text: text, isStreaming: false))],
+            mode: dto.name ?? (agent.isEmpty ? nil : agent),
+            model: model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextEstimate: MessageContextEstimate(userCharacters: text.count)
+        )
+    }
+
+    private func projectV2Shell(_ dto: V2SessionMessageDTO, agent: String, model: V2ModelRefDTO?) -> [Message] {
+        let command = dto.command ?? ""
+        let completed = dto.time?.completed != nil
+        let user = messageFromV2(
+            id: dto.id,
+            role: .user,
+            parts: command.isEmpty ? [] : [.text(TextPart(id: "\(dto.id):text:0", text: command, isStreaming: false))],
+            mode: agent.isEmpty ? nil : agent,
+            model: model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextEstimate: MessageContextEstimate(userCharacters: command.count)
+        )
+        let assistant = messageFromV2(
+            id: "\(dto.id):assistant",
+            role: .assistant,
+            parts: [
+                .tool(
+                    ToolPart(
+                        id: "\(dto.id):tool",
+                        toolName: "bash",
+                        status: completed ? .completed : .running,
+                        title: "Shell",
+                        callID: dto.callID,
+                        input: command.isEmpty ? nil : ["command": .string(command)],
+                        output: dto.output,
+                        metadata: dto.exit.map { ["exit": .int($0)] }
+                    )
+                )
+            ],
+            mode: agent.isEmpty ? nil : agent,
+            model: model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed
+        )
+        return [user, assistant]
+    }
+
+    private func projectV2Assistant(_ dto: V2SessionMessageDTO, agent: String, model: V2ModelRefDTO?) -> Message {
+        var ordinals: [String: Int] = [:]
+        let parts = dto.content.enumerated().compactMap { index, content -> MessagePart? in
+            let fallbackID: String
+            if let kind = V2ContentPartID.kind(contentType: content.type) {
+                let ordinal = ordinals[kind, default: 0]
+                ordinals[kind] = ordinal + 1
+                fallbackID = V2ContentPartID.make(messageID: dto.id, kind: kind, ordinal: String(ordinal))
+            } else {
+                fallbackID = "\(dto.id):\(content.type):\(index)"
+            }
+            return v2AssistantPart(content, fallbackID: fallbackID)
+        } + UploadedAttachmentMetadata.fileParts(UploadedAttachmentMetadata.refs(from: dto.metadata), messageID: dto.id)
+        let stopReason = MessageStopReason.from(finish: dto.finish, errorKind: dto.error?.type)
+        let failure = structuredFailure(dto.error, outcome: nil, completedAtEpochMs: dto.time?.completed)
+            ?? dto.retry?.error.flatMap {
+                structuredFailure($0, outcome: nil, completedAtEpochMs: dto.time?.completed)
+            }.flatMap { candidate in
+                dto.finish?.caseInsensitiveCompare("error") == .orderedSame ? candidate : nil
+            }
+        var message = messageFromV2(
+            id: dto.id,
+            role: .assistant,
+            parts: parts,
+            cost: dto.cost,
+            tokens: tokenUsage(from: dto.tokens),
+            mode: dto.agent ?? (agent.isEmpty ? nil : agent),
+            model: dto.model ?? model,
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextInputTokens: dto.tokens?.input,
+            contextEstimate: v2AssistantContextEstimate(dto.content),
+            failure: failure
+        )
+        message.stopReason = stopReason
+        return message
+    }
+
+    private func projectV2Compaction(_ dto: V2SessionMessageDTO) -> Message {
+        let summary = dto.summary ?? ""
+        // The summary is model context, not a reply: it rides on the compaction
+        // part so the timeline shows a compaction row instead of reply text.
+        let parts: [MessagePart] = [
+            .compaction(
+                CompactionPart(
+                    id: dto.id,
+                    auto: dto.reason == "auto",
+                    completed: dto.status?.caseInsensitiveCompare("completed") == .orderedSame,
+                    summary: summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : summary
+                )
+            )
+        ]
+        return messageFromV2(
+            id: dto.id,
+            role: .assistant,
+            parts: parts,
+            mode: "compaction",
+            sentAtEpochMs: dto.time?.created,
+            completedAtEpochMs: dto.time?.completed,
+            contextEstimate: MessageContextEstimate(assistantCharacters: summary.count),
+            failure: structuredFailure(
+                dto.error,
+                outcome: nil,
+                source: .compaction,
+                completedAtEpochMs: dto.time?.completed
+            )
+        )
+    }
+
+    /// A failed idle item is its own row when the assistant message did not already carry the same failure.
+    private func projectV2Idle(_ dto: V2SessionMessageDTO, messages: inout [Message]) {
+        guard let failure = structuredFailure(
+            dto.error,
+            outcome: dto.outcome,
+            source: .execution,
+            completedAtEpochMs: dto.time?.completed
+        ) else { return }
+        if messages.last?.failure?.line() == failure.line() { return }
+        messages.append(
+            messageFromV2(
+                id: dto.id,
+                role: .assistant,
+                parts: [],
+                sentAtEpochMs: dto.time?.created,
+                completedAtEpochMs: dto.time?.completed,
+                failure: failure
+            )
+        )
+    }
+
+    private func messageFromV2(
+        id: String,
+        role: MessageRole,
+        parts: [MessagePart],
+        fallbackText: String = "",
+        promptSkills: [PromptSkill] = [],
+        cost: Double? = nil,
+        tokens: MessageTokenUsage? = nil,
+        mode: String? = nil,
+        model: V2ModelRefDTO? = nil,
+        sentAtEpochMs: Int64? = nil,
+        completedAtEpochMs: Int64? = nil,
+        contextInputTokens: Int64? = nil,
+        contextEstimate: MessageContextEstimate = MessageContextEstimate(),
+        failure: SessionFailure? = nil
+    ) -> Message {
+        let flatText = displayText(from: parts)
+        return Message(
+            id: id,
+            role: role,
+            text: flatText.isEmpty ? fallbackText : flatText,
+            parts: parts,
+            cost: cost,
+            tokens: tokens,
+            model: model?.id,
+            modelProviderID: model?.providerID,
+            modelID: model?.id,
+            variant: model?.variant,
+            mode: mode,
+            sentAtEpochMs: sentAtEpochMs,
+            completedAtEpochMs: completedAtEpochMs,
+            contextInputTokens: contextInputTokens,
+            contextEstimate: contextEstimate,
+            failure: failure,
+            promptSkills: promptSkills
+        )
+    }
+
+    /// Skills ride on the user message. Keep id and name only — `text` is the
+    /// model-facing skill body and must not become a second chat bubble.
+    private func promptSkills(_ skills: [V2UserSkillDTO]) -> [PromptSkill] {
+        skills.compactMap { skill in
+            let id = skill.id?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? skill.name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let name = skill.name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? id
+            guard let name else { return nil }
+            return PromptSkill(
+                id: id ?? name,
+                name: name,
+                mentionText: skill.mention?.text?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                mentionStart: skill.mention?.start,
+                mentionEnd: skill.mention?.end
+            )
+        }
+    }
+
+    private func v2AssistantPart(_ content: V2AssistantContentDTO, fallbackID: String) -> MessagePart? {
+        switch content.type {
+        case "text":
+            guard let text = content.text else { return nil }
+            return .text(TextPart(id: content.id ?? fallbackID, text: text, isStreaming: false))
+        case "reasoning", "thinking":
+            return .reasoning(
+                ReasoningPart(
+                    id: content.id ?? fallbackID,
+                    text: content.text ?? "",
+                    isStreaming: false,
+                    timeStartEpochMs: content.time?.created,
+                    timeEndEpochMs: content.time?.completed
+                )
+            )
+        case "tool":
+            guard let name = content.name else { return nil }
+            let state = content.state
+            let metadata = state?.metadata ?? state?.structured
+            let status = toolStatus(from: state?.status)
+            return .tool(
+                ToolPart(
+                    id: content.id ?? fallbackID,
+                    toolName: name,
+                    status: status,
+                    // v2 tools report their progress title in metadata (v1: state.title).
+                    title: metadata?["title"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
+                    error: state?.error?.message.flatMap { message in
+                        let unwrapped = SessionFailure.unwrap(message)
+                        return unwrapped.isEmpty ? nil : unwrapped
+                    },
+                    callID: content.id,
+                    input: dictionaryFromInput(state?.input) ?? streamingInputPreview(state),
+                    output: toolOutput(state),
+                    metadata: metadata,
+                    timeStartEpochMs: content.time?.created,
+                    isInterrupted: status == .error && ToolInterruption.isAbortedType(state?.error?.type),
+                    isMalformed: SessionFailure.isMalformedTool(type: state?.error?.type, executed: state?.executed),
+                    images: v2ToolImages(state, ownerID: content.id ?? fallbackID)
+                )
+            )
+        default:
+            return nil
+        }
+    }
+
+    private func filePart(from dto: MessagePartDTO) -> MessagePart? {
+        let url = dto.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return resolvedFilePart(
+            id: dto.id ?? (url.isEmpty ? nil : url) ?? dto.filename ?? "file",
+            filename: dto.filename,
+            mime: dto.mime,
+            dataURL: url,
+            serverPath: dto.serverPath
+        )
+    }
+
+    private func v2FilePart(_ file: V2FileAttachmentDTO, fallbackID: String) -> MessagePart? {
+        resolvedFilePart(
+            id: fallbackID,
+            filename: file.name,
+            mime: file.mime,
+            dataURL: v2FileDataURL(file) ?? ""
+        )
+    }
+
+    private func resolvedFilePart(
+        id: String,
+        filename: String?,
+        mime: String?,
+        dataURL: String,
+        serverPath: String? = nil
+    ) -> MessagePart? {
+        let resolvedMime = (
+            mime
+                ?? AttachmentDataURL.mime(fromDataURL: dataURL)
+                ?? filename.flatMap(AttachmentDataURL.mime(fromFilename:))
+        )?.lowercased()
+        if let serverPath, !serverPath.isEmpty {
+            // Uploaded file: any type shows, at least as a chip.
+            let mime = resolvedMime ?? AttachmentMime.binaryFallback
+            return .file(
+                FilePart(
+                    id: id,
+                    filename: filename?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Attachment",
+                    mime: mime,
+                    kind: AttachmentMime.kind(for: mime),
+                    dataURL: "",
+                    serverPath: serverPath
+                )
+            )
+        }
+        guard let resolvedMime, let kind = AttachmentDataURL.kind(for: resolvedMime) else { return nil }
+        if !dataURL.isEmpty {
+            guard dataURL.lowercased().hasPrefix("data:"),
+                  AttachmentDataURL.validates(dataURL, mime: resolvedMime)
+            else { return nil }
+        }
+        return .file(
+            FilePart(
+                id: id,
+                filename: filename?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Attachment",
+                mime: resolvedMime,
+                kind: kind,
+                dataURL: dataURL
+            )
+        )
+    }
+
+    private func v2FileDataURL(_ file: V2FileAttachmentDTO) -> String? {
+        if let uri = file.uri?.nilIfEmpty { return uri }
+        if let uri = file.source?.uri?.nilIfEmpty { return uri }
+        guard let mime = file.mime, let data = file.data, let decoded = Data(base64Encoded: data) else {
+            return nil
+        }
+        return AttachmentDataURL.make(data: decoded, mime: mime)
+    }
+
+    private func dictionaryFromInput(_ input: AnyCodable?) -> [String: AnyCodable]? {
+        switch input {
+        case let .dictionary(object):
+            return object
+        case let .string(raw):
+            guard let data = raw.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode([String: AnyCodable].self, from: data)
+            else { return nil }
+            return decoded
+        default:
+            return nil
+        }
+    }
+
+    /// A tool whose arguments are still streaming keeps the partial text as its preview.
+    private func streamingInputPreview(_ state: V2ToolStateDTO?) -> [String: AnyCodable]? {
+        guard state?.status == "streaming" || state?.status == "pending",
+              case let .string(raw)? = state?.input
+        else { return nil }
+        return [ToolArgumentsPreview.inputKey: .string(raw)]
+    }
+
+    /// v2 tool `content` items of type `file` that the timeline can show as images.
+    private func v2ToolImages(_ state: V2ToolStateDTO?, ownerID: String) -> [FilePart] {
+        guard let content = state?.content, !content.isEmpty else { return [] }
+        var images: [FilePart] = []
+        var fileIndex = 0
+        for item in content where item.type == "file" {
+            defer { fileIndex += 1 }
+            if let image = toolImage(
+                id: Self.toolImageID(ownerID: ownerID, index: fileIndex),
+                filename: item.name,
+                mime: item.mime,
+                url: item.uri
+            ) {
+                images.append(image)
+            }
+        }
+        return images
+    }
+
+    private func toolOutput(_ state: V2ToolStateDTO?) -> String? {
+        let texts = state?.content.compactMap { item -> String? in
+            guard item.type == "text" else { return nil }
+            return item.text.flatMap { $0.isEmpty ? nil : $0 }
+        } ?? []
+        let joined = texts.joined(separator: "\n")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private func v2AssistantContextEstimate(_ content: [V2AssistantContentDTO]) -> MessageContextEstimate {
+        let assistantCharacters = content.reduce(0) { total, item in
+            switch item.type {
+            case "text", "reasoning":
+                total + (item.text?.count ?? 0)
+            default:
+                total
+            }
+        }
+        let toolCharacters = content.reduce(0) { total, item in
+            guard item.type == "tool", let state = item.state else { return total }
+            let inputOverhead = (dictionaryFromInput(state.input)?.keys.count ?? 0) * 16
+            let payload: Int
+            switch state.status {
+            case "pending", "streaming":
+                if case let .string(raw)? = state.input {
+                    payload = raw.count
+                } else {
+                    payload = 0
+                }
+            case "completed":
+                payload = toolOutput(state)?.count ?? 0
+            case "error":
+                payload = state.error?.message?.count ?? 0
+            default:
+                payload = 0
+            }
+            return total + inputOverhead + payload
+        }
+        return MessageContextEstimate(assistantCharacters: assistantCharacters, toolCharacters: toolCharacters)
+    }
+
+    private func role(from raw: String) -> MessageRole {
+        switch raw.lowercased() {
+        case "user":
+            .user
+        case "assistant":
+            .assistant
+        case "command":
+            .command
+        case "tool":
+            .tool
+        case "notice":
+            .notice
+        default:
+            .unknown
+        }
+    }
+
+    private func stopReason(_ info: MessageInfoDTO) -> MessageStopReason? {
+        guard info.role.lowercased() == "assistant" else { return nil }
+        return MessageStopReason.from(finish: info.finish, errorKind: info.error?.name)
+    }
+
+    private func sessionFailure(
+        _ error: MessageErrorInfoDTO?,
+        stopReason: MessageStopReason?,
+        completedAtEpochMs: Int64?
+    ) -> SessionFailure? {
+        if stopReason == .interrupted { return nil }
+        return SessionFailure.fromV1(
+            name: error?.name,
+            message: error?.data?.message,
+            statusCode: error?.data?.statusCode,
+            responseBody: error?.data?.responseBody,
+            isRetryable: error?.data?.isRetryable,
+            providerID: error?.data?.providerID,
+            retries: error?.data?.retries,
+            retryAfterMs: error?.data?.retryAfterMs,
+            recordedAtEpochMs: recordedAt(retryAfterMs: error?.data?.retryAfterMs, completedAtEpochMs: completedAtEpochMs)
+        )
+    }
+
+    private func structuredFailure(
+        _ error: V2UnknownErrorDTO?,
+        outcome: String?,
+        source: FailureSource = .step,
+        completedAtEpochMs: Int64?
+    ) -> SessionFailure? {
+        SessionFailure.fromV2(
+            type: error?.type,
+            message: error?.message,
+            status: error?.status,
+            providerBody: error?.response?.body,
+            outcome: outcome,
+            source: source,
+            retryAfterMs: error?.retryAfterMs,
+            recordedAtEpochMs: recordedAt(retryAfterMs: error?.retryAfterMs, completedAtEpochMs: completedAtEpochMs)
+        )
+    }
+
+    /// The failed message's completion time, else when the app received it. Only a retry hint needs it.
+    private func recordedAt(retryAfterMs: Int64?, completedAtEpochMs: Int64?) -> Int64? {
+        guard retryAfterMs != nil else { return nil }
+        return completedAtEpochMs ?? nowEpochMs()
+    }
+
+    private func httpMessage(_ body: String?) -> String {
+        if let friendly = ServerErrorMessage.userFacing(body) { return friendly }
+        let plain = body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if plain.isEmpty || plain.hasPrefix("{") || plain.count > 200 { return "Request failed" }
+        return plain
+    }
+
+    private func displayText(from parts: [MessagePart]) -> String {
+        let segments: [String] = parts.compactMap { part in
+            switch part {
+            case .text(let t):
+                guard t.isDisplayable else { return nil }
+                let trimmed = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            case .file, .tool, .compaction, .reasoning, .notice:
+                return nil
+            }
+        }
+        return segments.joined(separator: "\n")
+    }
+
+    private func tokenUsage(from dto: MessageTokensDTO?) -> MessageTokenUsage? {
+        guard let dto else { return nil }
+        return MessageTokenUsage(
+            input: dto.input ?? 0,
+            output: dto.output ?? 0,
+            reasoning: dto.reasoning ?? 0,
+            cacheRead: dto.cache?.read ?? 0,
+            cacheWrite: dto.cache?.write ?? 0
+        )
+    }
+
+    private func contextEstimate(role: String, parts: [MessagePartDTO]) -> MessageContextEstimate {
+        switch role.lowercased() {
+        case "user":
+            return MessageContextEstimate(
+                systemCharacters: parts.reduce(0) { $0 + ($1.system?.count ?? 0) },
+                userCharacters: parts.reduce(0) { $0 + userContextCharacters(from: $1) }
+            )
+        case "assistant":
+            let assistantCharacters = parts.reduce(0) { total, part in
+                switch part.type {
+                case "text", "reasoning":
+                    total + (part.text?.count ?? 0)
+                default:
+                    total
+                }
+            }
+            let toolCharacters = parts.reduce(0) { $0 + toolContextCharacters(from: $1) }
+            return MessageContextEstimate(assistantCharacters: assistantCharacters, toolCharacters: toolCharacters)
+        default:
+            return MessageContextEstimate()
+        }
+    }
+
+    private func userContextCharacters(from part: MessagePartDTO) -> Int {
+        switch part.type {
+        case "text":
+            return part.text?.count ?? 0
+        case "file":
+            if case let .dictionary(text)? = part.source?["text"],
+               case let .string(value)? = text["value"] {
+                return value.count
+            }
+            return 0
+        case "agent":
+            if case let .string(value)? = part.source?["value"] {
+                return value.count
+            }
+            return 0
+        default:
+            return 0
+        }
+    }
+
+    private func toolContextCharacters(from part: MessagePartDTO) -> Int {
+        guard part.type == "tool", let state = part.state else { return 0 }
+        let inputOverhead = (state.input?.keys.count ?? 0) * 16
+        switch state.status {
+        case "pending":
+            return inputOverhead + (state.raw?.count ?? 0)
+        case "completed":
+            return inputOverhead + (state.output?.count ?? 0)
+        case "error":
+            return inputOverhead + (state.error?.count ?? 0)
+        default:
+            return inputOverhead
+        }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+/// Part ids for v2 assistant text and reasoning, which the server stores without
+/// ids. Live events carry a per-message `ordinal` per kind; REST content keeps the
+/// same per-kind order, so both sides derive `<messageID>:<kind>:<ordinal>` and a
+/// reload replaces live parts in place.
+nonisolated enum V2ContentPartID {
+    static func make(messageID: String, kind: String, ordinal: String) -> String {
+        "\(messageID):\(kind):\(ordinal)"
+    }
+
+    static func kind(contentType: String) -> String? {
+        switch contentType {
+        case "text": "text"
+        case "reasoning", "thinking": "reasoning"
+        default: nil
+        }
+    }
+}

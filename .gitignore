@@ -1,0 +1,96 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.code-workspace
+
+# Android (see also android/.gitignore)
+**/.gradle/
+**/.kotlin/
+**/local.properties
+**/*.hprof
+**/.cxx/
+**/.externalNativeBuild/
+**/captures/
+
+# Xcode / Swift (iOS)
+**/xcuserdata/
+**/*.xcuserstate
+**/*.xccheckout
+**/DerivedData/
+build/
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.moved-aside
+*.hmap
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.xcodeproj/*_Generated.swift
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.jks
+*.keystore
+
+# Firebase client config: release CI injects it from secrets
+google-services.json
+GoogleService-Info.plist
+
+# Logs
+*.log
+
+# Node (icon sync tooling)
+node_modules/
+
+# OpenAPI fetch + generated clients
+build/openapi/
+android/app/build/generated/openapi/
+ios/OpenCode Mobile/Generated/
+
+# Lucide icon sync cache (generated assets are committed)
+icons/cache/
+
+# Theme research
+research/
+research/
+
+# Throwaway on-demand UI snapshot evidence (OPE-161)
+.snapshot-evidence/
+/snapshot-evidence/
+ios/OpenCode Mobile/OpenCode MobileTests/GeneratedSnapshotEvidence/
+android/app/src/test/java/dev/opencode/mobile/ui/snapshot/GeneratedSnapshotEvidence/
+android/app/src/test/snapshots/
+android/screenshot/src/test/java/dev/opencode/mobile/ui/snapshot/GeneratedSnapshotEvidence/
+android/screenshot/src/test/snapshots/
+**/*SnapshotEvidence.swift
+**/*SnapshotEvidence.kt
+
+# Store screenshot capture output
+/store-screenshots/
+/launch-graphics/
+
+# Signing material and local agent configuration never belong in the repository (#755)
+*.p8
+*.p12
+*.mobileprovision
+.mcp.json
+.claude/launch.json

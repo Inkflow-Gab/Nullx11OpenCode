@@ -1,0 +1,127 @@
+# Lucide catalog — see docs/design-system/icons.md
+icons:
+  - name: add
+    lucide: plus
+    notes: Generic add / plus affordances; Commands tile New
+  - name: arrow_back
+    lucide: arrow-left
+    notes: Back navigation; Terminal control strip Left
+  - name: arrow_forward
+    lucide: arrow-right
+    notes: Pair of arrow_back; Terminal control strip Right
+  - name: arrow_upward
+    lucide: arrow-up
+    notes: Queue / default Send; Go up row in Add project sheet
+  - name: arrow_warm_up
+    lucide: arrow-up-right
+    notes: Steer follow-up send
+  - name: arrow_downward
+    lucide: arrow-down
+    notes: Scroll-to-end action pill; Terminal control strip Down
+  - name: check
+    lucide: check
+    notes: Selected / complete mark
+  - name: chevron_right
+    lucide: chevron-right
+  - name: keyboard_arrow_down
+    lucide: chevron-down
+    notes: Title switcher chevron after home server name
+  - name: close
+    lucide: x
+    notes: Dismiss / close
+  - name: content_copy
+    lucide: copy
+    notes: Copy action
+  - name: collapse_content
+    lucide: minimize-2
+    notes: Outgoing message expanded state
+  - name: delete
+    lucide: trash-2
+    notes: Edit server top-bar remove
+  - name: description
+    lucide: file-text
+    notes: Document / file affordance
+  - name: edit
+    lucide: pencil
+  - name: expand_content
+    lucide: maximize-2
+    notes: Outgoing message collapsed state
+  - name: agent
+    lucide: brain
+    notes: Agent mention suggestions in the Session Composer
+  - name: folder
+    lucide: folder
+  - name: create_new_folder
+    lucide: folder-plus
+    notes: Add project — folder with plus (Session List Dock)
+  - name: folder_check
+    lucide: folder-check
+    notes: Current directory row in Add project sheet
+  - name: list
+    lucide: list
+  - name: more_vert
+    lucide: ellipsis-vertical
+  - name: search
+    lucide: search
+  - name: settings
+    lucide: settings
+    notes: Gear — home top bar Settings action
+  - name: sidebar
+    lucide: panel-left
+    notes: Tablet split view — show / hide the leading pane (Home list, Settings list)
+  - name: terminal
+    lucide: square-terminal
+    notes: open Terminal from home
+  - name: architecture
+    lucide: component
+    notes: Component Gallery entry in Settings
+  - name: archive
+    lucide: archive
+    notes: Session Chat overflow Archive action
+  - name: cloud
+    lucide: cloud
+    notes: Server Connection entry in Settings
+  - name: stop
+    lucide: square
+    notes: Session Composer abort action
+  - name: stop_circle
+    lucide: circle-stop
+  - name: subdirectory_arrow_right
+    lucide: corner-down-right
+    notes: Subdirectory rows in Add project sheet
+  - name: undo
+    lucide: undo-2
+    notes: Commands tile Undo
+  - name: redo
+    lucide: redo-2
+    notes: Commands tile Redo; pair of undo
+  - name: call_split
+    lucide: git-fork
+    notes: Commands tile Fork
+  - name: vertical_align_center
+    lucide: fold-vertical
+    notes: Commands tile Compact
+  - name: radio_button_checked
+    lucide: circle-dot
+    notes: Question option selected
+  - name: radio_button_unchecked
+    lucide: circle
+    notes: Question option unselected
+  - name: widgets
+    lucide: layout-grid
+    notes: All-projects mark; component gallery
+  - name: slash
+    lucide: square-slash
+    notes: Session Composer Commands action
+  - name: mic
+    lucide: mic
+    notes: Session Composer dictation
+  - name: plug
+    lucide: plug
+    notes: MCP servers tile in Commands sheet
+  - name: code
+    lucide: code
+    notes: Source Code row in Settings About
+  - name: lock
+    lucide: lock
+    notes: App lock toggle and the privacy cover shown while the app is in the background

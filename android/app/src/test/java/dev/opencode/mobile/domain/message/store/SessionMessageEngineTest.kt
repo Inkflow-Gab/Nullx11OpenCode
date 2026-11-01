@@ -1,0 +1,1005 @@
+package dev.opencode.mobile.domain.message
+
+import dev.opencode.mobile.domain.event.EventDomainAdapter
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class SessionMessageEngineTest {
+    private val store = InMemoryMessageStore(MessageDomainAdapter())
+    private val engine = SessionMessageEngine(store)
+
+    @Test
+    fun partDelta_returnsChangedAndAdvancesRevision() {
+        seedStreamingAssistant()
+        val before = engine.revision("ses-1")
+        val result =
+            engine.apply(
+                "ses-1",
+                MessagePatch.PartDelta(messageId = "msg-1", partId = "prt-1", delta = " world"),
+            )
+        assertTrue(result is MessageStoreApplyResult.Changed)
+        val changeSet = (result as MessageStoreApplyResult.Changed).changeSet
+        assertEquals(before + 1, changeSet.sessionRevision)
+        assertEquals(setOf("msg-1"), changeSet.changedMessageIds)
+        assertEquals(mapOf("msg-1" to setOf("prt-1")), changeSet.changedPartIdsByMessage)
+        assertTrue(engine.shouldPublishLive(changeSet))
+        assertEquals("Hello world", engine.messages("ses-1").single().text)
+    }
+
+    @Test
+    fun infoOnlyInsert_isNotLivePublishable() {
+        seedStreamingAssistant()
+        val result =
+            engine.apply(
+                "ses-1",
+                MessagePatch.InfoUpdated(
+                    buildJsonObject {
+                        put("id", "msg-2")
+                        put("role", "assistant")
+                        put("sessionID", "ses-1")
+                    },
+                ),
+            )
+        assertTrue(result is MessageStoreApplyResult.Changed)
+        val changeSet = (result as MessageStoreApplyResult.Changed).changeSet
+        assertFalse(engine.shouldPublishLive(changeSet))
+    }
+
+    @Test
+    fun deliveredPrompt_infoOnlyUpdate_isLivePublishable() {
+        val waitingInfo =
+            buildJsonObject {
+                put("id", "msg-u")
+                put("role", "user")
+                put("sessionID", "ses-1")
+                put("waiting", true)
+                put("delivery", "steer")
+            }
+        engine.apply("ses-1", MessagePatch.InfoUpdated(waitingInfo))
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "msg-u:text:0")
+                    put("messageID", "msg-u")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "Say hello.")
+                },
+                delta = null,
+            ),
+        )
+        assertTrue(engine.messages("ses-1").single().isWaitingForPickup)
+
+        // v2 `session.inbox.delivered` projects to an info with no parts.
+        val result =
+            engine.apply(
+                "ses-1",
+                MessagePatch.InfoUpdated(
+                    buildJsonObject {
+                        put("id", "msg-u")
+                        put("role", "user")
+                        put("sessionID", "ses-1")
+                        put("waiting", false)
+                    },
+                ),
+            )
+        val changeSet = (result as MessageStoreApplyResult.Changed).changeSet
+        assertEquals(setOf("msg-u"), changeSet.pickupStateChangedIds)
+        assertTrue(engine.shouldPublishLive(changeSet))
+        assertFalse(engine.messages("ses-1").single().isWaitingForPickup)
+    }
+
+    @Test
+    fun userInsert_landsBeforeStreamingAssistant() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(id = "msg-old-user", role = MessageRole.User, text = "Earlier"),
+                Message(
+                    id = "msg-old-asst",
+                    role = MessageRole.Assistant,
+                    text = "Done",
+                    parts = listOf(MessagePart.Text(text = "Done", id = "prt-old")),
+                ),
+                Message(
+                    id = "msg-live",
+                    role = MessageRole.Assistant,
+                    text = "Working",
+                    parts = listOf(MessagePart.Text(text = "Working", isStreaming = true, id = "prt-live")),
+                ),
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-new-user")
+                    put("role", "user")
+                    put("sessionID", "ses-1")
+                },
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "msg-new-user:text:0")
+                    put("messageID", "msg-new-user")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "Hello from CLI")
+                },
+                delta = null,
+            ),
+        )
+        assertEquals(
+            listOf("msg-old-user", "msg-old-asst", "msg-new-user", "msg-live"),
+            engine.messages("ses-1").map { it.id },
+        )
+    }
+
+    @Test
+    fun partDelta_chunkFlattenEqualsSequentialAppend() {
+        seedStreamingAssistant()
+        val chunks = listOf(" a", "b", "c", "🚀", "d")
+        for (chunk in chunks) {
+            engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-1", chunk))
+        }
+        assertEquals("Hello" + chunks.joinToString(""), engine.messages("ses-1").single().text)
+    }
+
+    @Test
+    fun infoUpdated_withoutId_isNoChange() {
+        seedStreamingAssistant()
+        val before = engine.revision("ses-1")
+        val result =
+            engine.apply(
+                "ses-1",
+                MessagePatch.InfoUpdated(
+                    buildJsonObject {
+                        put("role", "assistant")
+                        put("sessionID", "ses-1")
+                    },
+                ),
+            )
+        assertEquals(MessageStoreApplyResult.NoChange, result)
+        assertEquals(before, engine.revision("ses-1"))
+        assertEquals(listOf("msg-1"), engine.messages("ses-1").map { it.id })
+    }
+
+    @Test
+    fun removeUnknownMessage_isNoChange() {
+        seedStreamingAssistant()
+        val before = engine.revision("ses-1")
+        assertEquals(
+            MessageStoreApplyResult.NoChange,
+            engine.apply("ses-1", MessagePatch.Removed("missing")),
+        )
+        assertEquals(before, engine.revision("ses-1"))
+    }
+
+    @Test
+    fun partOrder_preservedAcrossDelta() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "AB",
+                    parts =
+                        listOf(
+                            MessagePart.Text(text = "A", id = "prt-a"),
+                            MessagePart.Tool(toolName = "bash", status = ToolStatus.Completed, id = "prt-tool"),
+                            MessagePart.Text(text = "B", id = "prt-b"),
+                        ),
+                ),
+            ),
+        )
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-b", "!"))
+        val parts = engine.messages("ses-1").single().parts
+        assertEquals(3, parts.size)
+        assertTrue(parts[0] is MessagePart.Text)
+        assertTrue(parts[1] is MessagePart.Tool)
+        assertTrue(parts[2] is MessagePart.Text)
+        assertEquals("B!", (parts[2] as MessagePart.Text).text)
+    }
+
+    @Test
+    fun frameAfterChange_splicesChangedMessageAndReusesSiblings() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(id = "msg-1", role = MessageRole.User, text = "Hi"),
+                Message(
+                    id = "msg-2",
+                    role = MessageRole.Assistant,
+                    text = "Hello",
+                    parts = listOf(MessagePart.Text(text = "Hello", isStreaming = true, id = "prt-1")),
+                ),
+            ),
+        )
+        val previous = engine.messages("ses-1")
+        val result = engine.apply("ses-1", MessagePatch.PartDelta("msg-2", "prt-1", "!"))
+        val changeSet = (result as MessageStoreApplyResult.Changed).changeSet
+        val next = engine.frameAfterChange("ses-1", changeSet, previous)
+        assertEquals(2, next.size)
+        assertSame(previous[0], next[0])
+        assertEquals("Hello!", next[1].text)
+    }
+
+    @Test
+    fun frameAfterChange_rebuildsWhenChangedMessageMissingFromPrevious() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(Message(id = "msg-a", role = MessageRole.User, text = "A")),
+        )
+        val previous = engine.messages("ses-1")
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-b")
+                    put("role", "assistant")
+                    put("sessionID", "ses-1")
+                },
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-b")
+                    put("messageID", "msg-b")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "")
+                },
+                delta = null,
+            ),
+        )
+        val result = engine.apply("ses-1", MessagePatch.PartDelta("msg-b", "prt-b", "Live"))
+        val changeSet = (result as MessageStoreApplyResult.Changed).changeSet
+        val next = engine.frameAfterChange("ses-1", changeSet, previous)
+        assertEquals(listOf("msg-a", "msg-b"), next.map { it.id })
+        assertEquals("Live", next.last().text)
+    }
+
+    @Test
+    fun finishStreaming_clearsStreamingFlag() {
+        seedStreamingAssistant()
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-1", " world"))
+        assertTrue(engine.hasStreamingText("ses-1"))
+        engine.finishStreamingText("ses-1")
+        assertFalse(engine.hasStreamingText("ses-1"))
+        assertEquals("Hello world", engine.messages("ses-1").single().text)
+    }
+
+    @Test
+    fun finishStreaming_clearsReasoningStreamingFlag() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Reasoning(text = "hmm", isStreaming = true, id = "prt-r"),
+                        ),
+                ),
+            ),
+        )
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-r", " more"))
+        assertTrue(engine.hasStreamingText("ses-1"))
+        engine.finishStreamingText("ses-1")
+        assertFalse(engine.hasStreamingText("ses-1"))
+        val reasoning =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Reasoning>()
+                .single()
+        assertFalse(reasoning.isStreaming)
+        assertEquals("hmm more", reasoning.text)
+    }
+
+    @Test
+    fun revision_isMonotonicAcrossMutations() {
+        seedStreamingAssistant()
+        val r0 = engine.revision("ses-1")
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-1", "a"))
+        val r1 = engine.revision("ses-1")
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-1", "b"))
+        val r2 = engine.revision("ses-1")
+        assertTrue(r1 > r0)
+        assertTrue(r2 > r1)
+    }
+
+    @Test
+    fun reasoningEnded_keepsStartFromWhenThinkingBegan() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Reasoning(
+                                text = "hmm",
+                                isStreaming = true,
+                                id = "prt-r",
+                                timeStartEpochMs = 1_000,
+                            ),
+                        ),
+                ),
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-r")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "reasoning")
+                    put("text", "hmm")
+                    put(
+                        "time",
+                        buildJsonObject {
+                            put("start", 2_000)
+                            put("end", 2_000)
+                        },
+                    )
+                },
+                delta = null,
+            ),
+        )
+        val reasoning =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Reasoning>()
+                .single()
+        assertEquals(1_000L, reasoning.timeStartEpochMs)
+        assertEquals(2_000L, reasoning.timeEndEpochMs)
+    }
+
+    @Test
+    fun runningToolWithoutTime_stampsStartAndPreservesAcrossUpdateAndReplaceAll() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts = listOf(MessagePart.Tool(toolName = "task", status = ToolStatus.Running, id = "prt-task")),
+                ),
+            ),
+        )
+        val seeded =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertTrue(seeded.timeStartEpochMs != null)
+        val stamped = seeded.timeStartEpochMs
+
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-task")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "tool")
+                    put("tool", "task")
+                    put(
+                        "state",
+                        buildJsonObject {
+                            put("status", "running")
+                        },
+                    )
+                },
+                delta = null,
+            ),
+        )
+        val updated =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals(stamped, updated.timeStartEpochMs)
+
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Tool(
+                                toolName = "task",
+                                status = ToolStatus.Running,
+                                id = "prt-task",
+                                timeStartEpochMs = 10L,
+                            ),
+                        ),
+                ),
+            ),
+        )
+        val reloaded =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals(stamped, reloaded.timeStartEpochMs)
+    }
+
+    @Test
+    fun mergeAuthoritative_patchesToolInputAndKeepsStartTime() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Tool(
+                                toolName = "subagent",
+                                status = ToolStatus.Running,
+                                id = "prt-task",
+                                timeStartEpochMs = 1_710_000_000_000L,
+                            ),
+                        ),
+                ),
+            ),
+        )
+        val stamped =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+                .timeStartEpochMs
+        val revision = engine.revision("ses-1")
+        assertTrue(
+            engine.mergeAuthoritativeIfRevision(
+                "ses-1",
+                listOf(
+                    Message(
+                        id = "msg-1",
+                        role = MessageRole.Assistant,
+                        text = "",
+                        parts =
+                            listOf(
+                                MessagePart.Tool(
+                                    toolName = "subagent",
+                                    status = ToolStatus.Completed,
+                                    id = "prt-task",
+                                    input = buildJsonObject { put("agent", "general") },
+                                ),
+                            ),
+                    ),
+                ),
+                revision,
+            ),
+        )
+        val tool =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals(ToolStatus.Completed, tool.status)
+        assertEquals(
+            "general",
+            tool.input
+                ?.get("agent")
+                ?.jsonPrimitive
+                ?.contentOrNull,
+        )
+        assertEquals(stamped, tool.timeStartEpochMs)
+    }
+
+    @Test
+    fun mergeAuthoritative_staleRevisionIsNoOp() {
+        seedStreamingAssistant()
+        val stale = engine.revision("ses-1")
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartDelta(messageId = "msg-1", partId = "prt-1", delta = " world"),
+        )
+        assertFalse(
+            engine.mergeAuthoritativeIfRevision(
+                "ses-1",
+                listOf(
+                    Message(
+                        id = "msg-1",
+                        role = MessageRole.Assistant,
+                        text = "Nope",
+                        parts = listOf(MessagePart.Text(text = "Nope", id = "prt-1")),
+                    ),
+                ),
+                stale,
+            ),
+        )
+        assertEquals("Hello world", engine.messages("ses-1").single().text)
+    }
+
+    @Test
+    fun partUpdated_lateRunningDuplicateDoesNotReopenSettledTool() {
+        fun toolUpdate(status: String) =
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-r")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "tool")
+                    put("tool", "read")
+                    put(
+                        "state",
+                        buildJsonObject {
+                            put("status", status)
+                            put("input", buildJsonObject { put("filePath", "/repo/src/currency.ts") })
+                            if (status == "error") put("error", "File not found")
+                        },
+                    )
+                },
+                delta = null,
+            )
+        engine.replaceAll(
+            "ses-1",
+            listOf(Message(id = "msg-1", role = MessageRole.Assistant, text = "", parts = emptyList())),
+        )
+        // v1 delivers every update on /global/event and /event; the buses interleave.
+        listOf("running", "error", "running").forEach { engine.apply("ses-1", toolUpdate(it)) }
+        val tool =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals(ToolStatus.Error, tool.status)
+        assertEquals("File not found", tool.error)
+    }
+
+    @Test
+    fun partUpdated_overlaysToolFieldsInsteadOfReplacing() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Tool(
+                                toolName = "websearch",
+                                status = ToolStatus.Pending,
+                                id = "prt-s",
+                                input = buildJsonObject { put("query", "opencode mobile") },
+                            ),
+                        ),
+                ),
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-s")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "tool")
+                    put("tool", "")
+                    put(
+                        "state",
+                        buildJsonObject {
+                            put("status", "completed")
+                            put("input", buildJsonObject { })
+                        },
+                    )
+                },
+                delta = null,
+            ),
+        )
+        val tool =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals("websearch", tool.toolName)
+        assertEquals(ToolStatus.Completed, tool.status)
+        assertEquals(
+            "opencode mobile",
+            tool.input
+                ?.get("query")
+                ?.jsonPrimitive
+                ?.contentOrNull,
+        )
+    }
+
+    @Test
+    fun partUpdated_emptyTextDoesNotReplaceStreamingText() {
+        seedStreamingAssistant()
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-1")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "")
+                },
+                delta = null,
+            ),
+        )
+        engine.apply("ses-1", MessagePatch.PartDelta("msg-1", "prt-1", " world"))
+        val text =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Text>()
+                .single()
+        assertEquals("Hello world", text.text)
+        assertTrue(text.isStreaming)
+    }
+
+    @Test
+    fun mergeAuthoritative_finishesStreamingWhenRestPartsLackIds() {
+        seedStreamingAssistant()
+        val revision = engine.revision("ses-1")
+        assertTrue(
+            engine.mergeAuthoritativeIfRevision(
+                "ses-1",
+                listOf(
+                    Message(
+                        id = "msg-1",
+                        role = MessageRole.Assistant,
+                        text = "Hello",
+                        parts = listOf(MessagePart.Text(text = "Hello", isStreaming = false)),
+                    ),
+                ),
+                revision,
+            ),
+        )
+        val text =
+            engine
+                .messages("ses-1")
+                .single()
+                .parts
+                .filterIsInstance<MessagePart.Text>()
+                .single()
+        assertEquals("Hello", text.text)
+        assertFalse(text.isStreaming)
+    }
+
+    @Test
+    fun infoUpdated_keepsDeliveryWhenWaitingUpdateOmitsIt() {
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-1")
+                    put("role", "user")
+                    put("sessionID", "ses-1")
+                    put("waiting", true)
+                    put("delivery", "queue")
+                },
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "msg-1:text:0")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "Hello")
+                },
+                delta = null,
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-1")
+                    put("role", "user")
+                    put("sessionID", "ses-1")
+                    put("waiting", true)
+                },
+            ),
+        )
+        val message = engine.messages("ses-1").single()
+        assertEquals(FollowUpDelivery.Queue, message.followUpDelivery)
+        assertTrue(message.isWaitingForPickup)
+    }
+
+    @Test
+    fun applyTail_preservesOlderLocalRows() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(id = "old", role = MessageRole.User, text = "Old"),
+                Message(id = "new", role = MessageRole.User, text = "New"),
+            ),
+        )
+        val revision = engine.revision("ses-1")
+        assertTrue(
+            engine.applyTailIfRevision(
+                "ses-1",
+                listOf(Message(id = "new", role = MessageRole.User, text = "New")),
+                revision,
+            ),
+        )
+        assertEquals(listOf("old", "new"), engine.messages("ses-1").map { it.id })
+    }
+
+    @Test
+    fun mergeTailAuthoritative_preservesExistingPartState() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(id = "old", role = MessageRole.User, text = "Old"),
+                Message(
+                    id = "new",
+                    role = MessageRole.Assistant,
+                    text = "",
+                    parts =
+                        listOf(
+                            MessagePart.Tool(
+                                toolName = "bash",
+                                status = ToolStatus.Running,
+                                output = "partial output",
+                                id = "tool-1",
+                                timeStartEpochMs = 42L,
+                            ),
+                        ),
+                ),
+            ),
+        )
+        val originalTool =
+            engine
+                .messages("ses-1")
+                .last()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        val revision = engine.revision("ses-1")
+
+        assertTrue(
+            engine.mergeTailAuthoritativeIfRevision(
+                "ses-1",
+                listOf(
+                    Message(
+                        id = "new",
+                        role = MessageRole.Assistant,
+                        text = "",
+                        parts =
+                            listOf(
+                                MessagePart.Tool(
+                                    toolName = "bash",
+                                    status = ToolStatus.Completed,
+                                    id = "tool-1",
+                                ),
+                            ),
+                    ),
+                ),
+                revision,
+            ),
+        )
+
+        val messages = engine.messages("ses-1")
+        val tool =
+            messages
+                .last()
+                .parts
+                .filterIsInstance<MessagePart.Tool>()
+                .single()
+        assertEquals(listOf("old", "new"), messages.map { it.id })
+        assertEquals(ToolStatus.Completed, tool.status)
+        assertEquals("partial output", tool.output)
+        assertEquals(originalTool.timeStartEpochMs, tool.timeStartEpochMs)
+    }
+
+    @Test
+    fun prependOlder_doesNotOverwriteNewerLiveText() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(Message(id = "new", role = MessageRole.User, text = "Live")),
+        )
+        val revision = engine.revision("ses-1")
+        assertTrue(
+            engine.prependOlderIfRevision(
+                "ses-1",
+                listOf(
+                    Message(id = "old", role = MessageRole.User, text = "Older"),
+                    Message(id = "new", role = MessageRole.User, text = "Stale"),
+                ),
+                revision,
+            ),
+        )
+        val messages = engine.messages("ses-1")
+        assertEquals(listOf("old", "new"), messages.map { it.id })
+        assertEquals("Live", messages.last().text)
+    }
+
+    @Test
+    fun prependOlder_staleRevisionIsNoOpAndPreservesSse() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "live",
+                    role = MessageRole.Assistant,
+                    text = "Hello",
+                    parts = listOf(MessagePart.Text(text = "Hello", isStreaming = true, id = "prt-1")),
+                ),
+            ),
+        )
+        val stale = engine.revision("ses-1")
+        engine.apply("ses-1", MessagePatch.PartDelta(messageId = "live", partId = "prt-1", delta = " world"))
+        assertFalse(
+            engine.prependOlderIfRevision(
+                "ses-1",
+                listOf(
+                    Message(id = "old", role = MessageRole.User, text = "Older"),
+                    Message(id = "live", role = MessageRole.Assistant, text = "Stale"),
+                ),
+                stale,
+            ),
+        )
+        assertEquals(listOf("live"), engine.messages("ses-1").map { it.id })
+        assertEquals("Hello world", engine.messages("ses-1").first().text)
+
+        assertTrue(
+            engine.prependOlderIfRevision(
+                "ses-1",
+                listOf(
+                    Message(id = "old", role = MessageRole.User, text = "Older"),
+                    Message(id = "live", role = MessageRole.Assistant, text = "Stale"),
+                ),
+                engine.revision("ses-1"),
+            ),
+        )
+        val messages = engine.messages("ses-1")
+        assertEquals(listOf("old", "live"), messages.map { it.id })
+        assertEquals("Hello world", messages.last().text)
+    }
+
+    @Test
+    fun infoUpdated_keepsSeededFailureWhenTheLiveInfoOmitsError() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "Partial answer",
+                    model = "gpt",
+                    mode = "build",
+                    failure = SessionFailure(type = "provider.rate-limit", message = "Slow down", status = 429),
+                ),
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.PartUpdated(
+                buildJsonObject {
+                    put("id", "prt-1")
+                    put("messageID", "msg-1")
+                    put("sessionID", "ses-1")
+                    put("type", "text")
+                    put("text", "Partial answer")
+                },
+                delta = null,
+            ),
+        )
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-1")
+                    put("role", "assistant")
+                    put("sessionID", "ses-1")
+                },
+            ),
+        )
+
+        val kept = engine.messages("ses-1").single()
+        assertEquals("Slow down", kept.failure?.message)
+        assertEquals(429, kept.failure?.status)
+
+        engine.apply(
+            "ses-1",
+            MessagePatch.InfoUpdated(
+                buildJsonObject {
+                    put("id", "msg-1")
+                    put("role", "assistant")
+                    put("sessionID", "ses-1")
+                    put("error", JsonNull)
+                },
+            ),
+        )
+        assertNull(engine.messages("ses-1").single().failure)
+    }
+
+    @Test
+    fun compactionEnded_clearsTheFailureARetryReused() {
+        applyProjected(
+            """{"type":"session.compaction.failed","data":{"sessionID":"ses-1","messageID":"msg-c",""" +
+                """"error":{"type":"compaction.failed","message":"Could not compact"}}}""",
+        )
+        assertEquals("Could not compact", engine.messages("ses-1").single().failure?.message)
+
+        applyProjected(
+            """{"type":"session.compaction.ended","data":{"sessionID":"ses-1","messageID":"msg-c","text":"Done"}}""",
+        )
+        assertNull(engine.messages("ses-1").single().failure)
+    }
+
+    private fun applyProjected(line: String) {
+        EventDomainAdapter(Json { ignoreUnknownKeys = true }).parseEvents(line).forEach { event ->
+            val properties = event.rawProperties ?: return@forEach
+            when (event.type) {
+                "message.updated" ->
+                    engine.apply("ses-1", MessagePatch.InfoUpdated(properties["info"]!!.jsonObject))
+                "message.part.updated" ->
+                    engine.apply("ses-1", MessagePatch.PartUpdated(properties["part"]!!.jsonObject, null))
+            }
+        }
+    }
+
+    private fun seedStreamingAssistant() {
+        engine.replaceAll(
+            "ses-1",
+            listOf(
+                Message(
+                    id = "msg-1",
+                    role = MessageRole.Assistant,
+                    text = "Hello",
+                    parts = listOf(MessagePart.Text(text = "Hello", isStreaming = true, id = "prt-1")),
+                ),
+            ),
+        )
+    }
+}

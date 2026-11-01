@@ -1,0 +1,37 @@
+{
+  "id": "nocturne",
+  "name": "Nocturne",
+  "blurb": "One Dark family",
+  "light": {
+    "syntax-keyword": "#A626A4",
+    "syntax-string": "#50A14F",
+    "syntax-number": "#986801",
+    "syntax-constant": "#986801",
+    "syntax-comment": "#A0A1A7",
+    "syntax-type": "#C18401",
+    "syntax-function": "#4078F2",
+    "syntax-property": "#E45649",
+    "syntax-attribute": "#C18401",
+    "syntax-variable": "#383A42",
+    "syntax-operator": "#383A42",
+    "syntax-punctuation": "#383A42",
+    "syntax-background": "#FAFAFA",
+    "syntax-foreground": "#383A42"
+  },
+  "dark": {
+    "syntax-keyword": "#C678DD",
+    "syntax-string": "#98C379",
+    "syntax-number": "#D19A66",
+    "syntax-constant": "#D19A66",
+    "syntax-comment": "#7F848E",
+    "syntax-type": "#E5C07B",
+    "syntax-function": "#61AFEF",
+    "syntax-property": "#E06C75",
+    "syntax-attribute": "#E5C07B",
+    "syntax-variable": "#ABB2BF",
+    "syntax-operator": "#ABB2BF",
+    "syntax-punctuation": "#ABB2BF",
+    "syntax-background": "#282C34",
+    "syntax-foreground": "#ABB2BF"
+  }
+}

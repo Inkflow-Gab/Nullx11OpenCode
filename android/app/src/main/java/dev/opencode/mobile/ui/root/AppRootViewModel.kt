@@ -1,0 +1,108 @@
+package dev.opencode.mobile.ui.root
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.opencode.mobile.domain.connection.ConnectionProfileStore
+import dev.opencode.mobile.domain.connection.ConnectionSessionCoordinator
+import dev.opencode.mobile.domain.event.ForegroundEventStream
+import dev.opencode.mobile.domain.event.WorldSignals
+import dev.opencode.mobile.domain.preferences.AppOnboardingPreferences
+import dev.opencode.mobile.domain.preferences.SessionChatDisplayPreferences
+import dev.opencode.mobile.network.ActiveConnectionManager
+import dev.opencode.mobile.network.OpencodeHttpClient
+import dev.opencode.mobile.network.OpencodeSseHttpClient
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import javax.inject.Inject
+
+enum class AppRootState {
+    Loading,
+    AppOnboarding,
+    Home,
+}
+
+@HiltViewModel
+class AppRootViewModel
+    @Inject
+    constructor(
+        private val connectionProfileStore: ConnectionProfileStore,
+        private val activeConnectionManager: ActiveConnectionManager,
+        private val connectionSessionCoordinator: ConnectionSessionCoordinator,
+        private val worldSignals: WorldSignals,
+        private val eventStream: ForegroundEventStream,
+        private val httpClient: OpencodeHttpClient,
+        private val sseHttpClient: OpencodeSseHttpClient,
+    ) : ViewModel() {
+        private val _state = MutableStateFlow(AppRootState.Loading)
+        val state: StateFlow<AppRootState> = _state.asStateFlow()
+
+        private val _presentConnectionSetup = MutableStateFlow(false)
+        val presentConnectionSetup: StateFlow<Boolean> = _presentConnectionSetup.asStateFlow()
+
+        private val _homeResetGeneration = MutableStateFlow(0)
+        val homeResetGeneration: StateFlow<Int> = _homeResetGeneration.asStateFlow()
+
+        init {
+            viewModelScope.launch {
+                loadInitialState()
+            }
+            viewModelScope.launch {
+                // Leave the open session as soon as the user picks a server, before probes finish.
+                connectionSessionCoordinator.profileSwitching.collect {
+                    _homeResetGeneration.update { it + 1 }
+                }
+            }
+            viewModelScope.launch {
+                connectionSessionCoordinator.profileSaved.collect {
+                    enterHome()
+                    _homeResetGeneration.update { it + 1 }
+                }
+            }
+            viewModelScope.launch {
+                // Clear All Data (or removing the last profile) drops every session, so Home must
+                // forget its split-view selection just like on a profile switch.
+                connectionSessionCoordinator.profileCleared.collect {
+                    _homeResetGeneration.update { it + 1 }
+                }
+            }
+        }
+
+        private suspend fun loadInitialState() {
+            activeConnectionManager.ensureLoaded()
+            connectionSessionCoordinator.bindActiveProfile()
+            eventStream.stop()
+            yield()
+            httpClient.rebuild()
+            sseHttpClient.rebuild()
+            val hasProfile = connectionProfileStore.activeProfile() != null
+            val existingInstall = AppOnboardingPreferences.isCompleted || hasProfile
+            SessionChatDisplayPreferences.resolveTimelineForInstall(existingInstall)
+            if (!existingInstall) {
+                _state.value = AppRootState.AppOnboarding
+            } else {
+                enterHome()
+                worldSignals.onConnectionAvailable()
+            }
+        }
+
+        fun completeAppOnboarding(openConnectionSetup: Boolean) {
+            AppOnboardingPreferences.markCompleted()
+            enterHome()
+            if (openConnectionSetup) {
+                _presentConnectionSetup.value = true
+            }
+        }
+
+        fun consumePresentConnectionSetup() {
+            _presentConnectionSetup.value = false
+        }
+
+        private fun enterHome() {
+            _state.value = AppRootState.Home
+        }
+    }

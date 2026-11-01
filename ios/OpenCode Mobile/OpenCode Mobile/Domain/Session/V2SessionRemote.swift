@@ -1,0 +1,223 @@
+import Foundation
+
+struct V2SessionRemote: SessionRemote, Sendable {
+    private let api: SessionsAPIClient
+    private let adapter: SessionDomainAdapter
+
+    init(api: SessionsAPIClient, adapter: SessionDomainAdapter) {
+        self.api = api
+        self.adapter = adapter
+    }
+
+    func listPendingPermissions(directory: String?) async throws -> [PermissionRequest] {
+        try await api.listPendingPermissionsV2(directory: directory).map { adapter.permissionRequest(from: $0) }
+    }
+
+    func listPendingQuestions(directory: String?) async throws -> [QuestionRequest] {
+        try await api.listPendingFormsV2(directory: directory).map { adapter.questionRequest(from: $0) }
+    }
+
+    func listSessions(directory: String?) async throws -> [Session] {
+        let projectID = await listableProjectID(directory: directory)
+        return try await api.listSessionsV2(
+            directory: projectID == nil ? directory : nil,
+            projectID: projectID,
+            archived: false
+        ).map { adapter.session(from: $0) }
+    }
+
+    private func listableProjectID(directory: String?) async -> String? {
+        guard let directory else { return nil }
+        guard let location = try? await api.locationForSessionList(directory: directory) else { return nil }
+        return Self.listableProjectID(location)
+    }
+
+    static func listableProjectID(_ location: V2LocationInfoDTO) -> String? {
+        guard let id = location.project?.id, !id.isEmpty else { return nil }
+        let root = location.project?.canonical ?? location.project?.directory
+        // Non-git directories resolve to the global "/" project, which is not this folder's sessions.
+        if root == nil || root?.isEmpty == true || root == "/" { return nil }
+        return id
+    }
+
+    func createSession(parentID: String?, title: String?, directory: String?) async throws -> Session {
+        var created = adapter.session(from: try await api.createSessionV2(directory: directory, title: title, parentID: parentID))
+        if let title, !title.isEmpty, created.title != title {
+            created.title = title
+        } else if created.title.isEmpty {
+            created.title = "New Session"
+        }
+        return created
+    }
+
+    func getAllSessionStatuses(directory _: String?) async throws -> [SessionStatus] {
+        adapter.sessionStatuses(fromActive: try await api.getActiveSessionsV2())
+    }
+
+    func getSession(id: String, directory _: String?) async throws -> Session {
+        adapter.session(from: try await api.getSessionV2(id: id))
+    }
+
+    func updateSession(id: String, title: String?, directory _: String?) async throws -> Session {
+        guard let title, !title.isEmpty else {
+            throw SessionError.transport("V2 rename requires a title")
+        }
+        try await api.renameSessionV2(id: id, title: title)
+        var renamed = adapter.session(from: try await api.getSessionV2(id: id))
+        renamed.title = title
+        return renamed
+    }
+
+    /// Callers gate on `supportsSessionArchive`; servers before 2.1.0 would ignore the field.
+    func archiveSession(id: String, directory _: String?) async throws -> Session {
+        try await api.setSessionArchivedV2(id: id, archived: true)
+        var archived = adapter.session(from: try await api.getSessionV2(id: id))
+        if !archived.isArchived {
+            archived.archivedAtEpochMs = Int64(Date().timeIntervalSince1970 * 1000)
+        }
+        return archived
+    }
+
+    func deleteSession(id: String, directory _: String?) async throws -> Bool {
+        try await api.deleteSessionV2(id: id)
+    }
+
+    func listChildSessions(id: String) async throws -> [Session] {
+        try await api.listSessionsV2(parentID: id)
+            .map { adapter.session(from: $0) }
+    }
+
+    func listSessionTodos(id _: String, directory _: String?) async throws -> [SessionTodo] {
+        throw SessionError.http(statusCode: 404, message: "Todos REST is unavailable on v2")
+    }
+
+    func initializeSessionAgents(id _: String, messageID _: String, providerID _: String, modelID _: String) async throws -> Bool {
+        throw SessionError.http(statusCode: 404, message: "session init is not available")
+    }
+
+    func forkSession(id: String, atMessageID: String?) async throws -> Session {
+        adapter.session(from: try await api.forkSessionV2(id: id, messageID: atMessageID))
+    }
+
+    func abortSession(id: String, directory _: String?) async throws -> Bool {
+        try await api.interruptSessionV2(id: id)
+    }
+
+    func shareSession(id _: String) async throws -> Session {
+        throw SessionError.http(statusCode: 404, message: "session share is not available")
+    }
+
+    func unshareSession(id _: String) async throws -> Session {
+        throw SessionError.http(statusCode: 404, message: "session share is not available")
+    }
+
+    func getSessionDiff(id: String, messageID: String?, directory _: String?) async throws -> [FileDiff] {
+        try await api.getSessionDiffV2(id: id, from: messageID).map(adapter.fileDiff)
+    }
+
+    func getVcsInfo(directory: String?) async throws -> VcsInfo {
+        adapter.vcsInfo(from: try await api.getVcsInfoV2(directory: directory))
+    }
+
+    func getVcsStatus(directory: String?) async throws -> [VcsFileStatus] {
+        try await api.getVcsStatusV2(directory: directory).map(adapter.vcsFileStatus)
+    }
+
+    func getVcsDiff(mode: VcsDiffMode, directory: String?, context: Int) async throws -> [FileDiff] {
+        try await api.getVcsDiffV2(mode: mode.v2WireValue, directory: directory, context: context).map(adapter.fileDiff)
+    }
+
+    func summarizeSession(id: String, providerID _: String, modelID _: String) async throws -> Bool {
+        try await api.compactSessionV2(id: id)
+    }
+
+    func compactSession(id: String, providerID _: String, modelID _: String) async throws -> CompactionStart {
+        _ = try await api.compactSessionV2(id: id)
+        return .enqueued
+    }
+
+    func revertSession(id: String, messageID: String, partID: String?) async throws -> Bool {
+        try await api.stageRevertV2(id: id, messageID: messageID, partID: partID)
+    }
+
+    func unrevertSession(id: String) async throws -> Bool {
+        try await api.clearRevertV2(id: id)
+    }
+
+    func commitRevert(id: String) async throws -> Bool {
+        try await api.commitRevertV2(id: id)
+    }
+
+    func respondToPermission(
+        sessionID: String,
+        permissionID: String,
+        decision: PermissionDecision,
+        directory _: String?
+    ) async throws -> Bool {
+        try await api.respondToPermissionV2(
+            sessionID: sessionID,
+            permissionID: permissionID,
+            body: V2PermissionReplyRequestDTO(decision: adapter.permissionResponse(decision))
+        )
+    }
+
+    func replyToQuestion(questionID: String, answers: [[String]], directory: String?) async throws -> Bool {
+        try await replyToQuestion(questionID: questionID, answers: answers, directory: directory, sessionID: nil)
+    }
+
+    func replyToQuestion(
+        questionID: String,
+        answers: [[String]],
+        directory: String?,
+        sessionID: String?
+    ) async throws -> Bool {
+        try await replyToQuestion(questionID: questionID, answers: answers, directory: directory, sessionID: sessionID, questions: [])
+    }
+
+    func replyToQuestion(
+        questionID: String,
+        answers: [[String]],
+        directory _: String?,
+        sessionID: String?,
+        questions: [QuestionInfo]
+    ) async throws -> Bool {
+        try await api.replyToFormV2(
+            sessionID: sessionID ?? "",
+            formID: questionID,
+            body: V2FormReplyRequestDTO(answer: adapter.formAnswer(questions: questions, answers: answers))
+        )
+    }
+
+    func rejectQuestion(questionID: String, directory: String?) async throws -> Bool {
+        try await rejectQuestion(questionID: questionID, directory: directory, sessionID: nil)
+    }
+
+    func rejectQuestion(questionID: String, directory _: String?, sessionID: String?) async throws -> Bool {
+        try await api.cancelFormV2(sessionID: sessionID ?? "", formID: questionID)
+    }
+
+    func cancelPendingPrompt(sessionID: String, inboxID: String) async throws -> Bool {
+        try await api.cancelInboxV2(sessionID: sessionID, inboxID: inboxID)
+    }
+
+    func steerPendingPrompt(sessionID: String, inboxID: String) async throws -> Bool {
+        try await api.steerInboxV2(sessionID: sessionID, inboxID: inboxID)
+    }
+
+    func queuePendingPrompt(sessionID: String, inboxID: String) async throws -> Bool {
+        try await api.queueInboxV2(sessionID: sessionID, inboxID: inboxID)
+    }
+
+    func markSessionViewed(sessionId: String, idleAtEpochMs: Int64) async throws {
+        _ = try await api.markSessionViewedV2(id: sessionId, idle: idleAtEpochMs)
+    }
+
+    func moveSession(id: String, directory: String) async throws {
+        _ = try await api.moveSessionV2(id: id, directory: directory)
+    }
+
+    func askSideQuestion(sessionID: String, question: String) async throws -> String {
+        let text = try await api.generateSessionTextV2(id: sessionID, prompt: SideQuestion.prompt(question))
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

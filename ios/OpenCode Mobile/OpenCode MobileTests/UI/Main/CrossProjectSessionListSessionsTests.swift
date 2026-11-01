@@ -1,0 +1,280 @@
+import Testing
+@testable import OpenCode_Mobile
+
+struct CrossProjectSessionListSessionsTests {
+    @Test func sameIdInTwoProjects_keepsNewerRowFromLaterProject() {
+        let sessions = [
+            section(worktree: "/earlier", session(id: "ses", title: "older", updatedAtEpochMs: 10)),
+            section(worktree: "/later", session(id: "ses", title: "newer", updatedAtEpochMs: 20)),
+        ].crossProjectSessionListSessions()
+
+        #expect(sessions.map(\.id) == ["ses"])
+        #expect(sessions.first?.title == "newer")
+        #expect(sessions.first?.worktree == "path:/later")
+        #expect(sessions.first?.updatedAtEpochMs == 20)
+    }
+
+    @Test func sameId_equalTimestamps_keepsEarlierProject() {
+        let sessions = [
+            section(worktree: "/earlier", session(id: "ses", title: "first", updatedAtEpochMs: 10)),
+            section(worktree: "/later", session(id: "ses", title: "second", updatedAtEpochMs: 10)),
+        ].crossProjectSessionListSessions()
+
+        #expect(sessions.map(\.id) == ["ses"])
+        #expect(sessions.first?.title == "first")
+        #expect(sessions.first?.worktree == "path:/earlier")
+    }
+
+    @Test func sameId_nullTimestampLosesToRealTimestamp() {
+        let realThenNull = [
+            section(worktree: "/real", session(id: "ses", title: "dated", updatedAtEpochMs: 50)),
+            section(worktree: "/missing", session(id: "ses", title: "undated", updatedAtEpochMs: nil)),
+        ].crossProjectSessionListSessions()
+        let nullThenReal = [
+            section(worktree: "/missing", session(id: "ses", title: "undated", updatedAtEpochMs: nil)),
+            section(worktree: "/real", session(id: "ses", title: "dated", updatedAtEpochMs: 50)),
+        ].crossProjectSessionListSessions()
+
+        #expect(realThenNull.map(\.worktree) == ["path:/real"])
+        #expect(realThenNull.first?.updatedAtEpochMs == 50)
+        #expect(nullThenReal.map(\.worktree) == ["path:/real"])
+        #expect(nullThenReal.first?.updatedAtEpochMs == 50)
+    }
+
+    @Test func distinctIds_stayNewestFirst() {
+        let sessions = [
+            section(
+                worktree: "/a",
+                session(id: "old", title: "Old", updatedAtEpochMs: 100),
+                session(id: "tie-early", title: "Early", updatedAtEpochMs: 50)
+            ),
+            section(
+                worktree: "/b",
+                session(id: "tie-late", title: "Late", updatedAtEpochMs: 50),
+                session(id: "newest", title: "Newest", updatedAtEpochMs: 200)
+            ),
+        ].crossProjectSessionListSessions()
+
+        #expect(sessions.map(\.id) == ["newest", "old", "tie-early", "tie-late"])
+    }
+
+    @Test func sameIdTwiceInOneProject_keepsNewerRow() {
+        let newerLast = [
+            section(
+                worktree: "/a",
+                session(id: "ses", title: "older", updatedAtEpochMs: 10),
+                session(id: "ses", title: "newer", updatedAtEpochMs: 30)
+            ),
+        ].crossProjectSessionListSessions()
+        let newerFirst = [
+            section(
+                worktree: "/a",
+                session(id: "ses", title: "newer", updatedAtEpochMs: 30),
+                session(id: "ses", title: "older", updatedAtEpochMs: 10)
+            ),
+        ].crossProjectSessionListSessions()
+
+        #expect(newerLast.map(\.title) == ["newer"])
+        #expect(newerLast.first?.updatedAtEpochMs == 30)
+        #expect(newerFirst.map(\.title) == ["newer"])
+        #expect(newerFirst.first?.updatedAtEpochMs == 30)
+    }
+
+    @Test func projectCounts_followTheWinningWorktree() {
+        let sections = [
+            section(
+                worktree: "/earlier",
+                session(id: "shared", title: "older", updatedAtEpochMs: 10),
+                session(id: "local", title: "stays", updatedAtEpochMs: 5)
+            ),
+            section(worktree: "/later", session(id: "shared", title: "newer", updatedAtEpochMs: 20)),
+            section(worktree: "/empty-after-dedupe", session(id: "shared", title: "oldest", updatedAtEpochMs: 1)),
+        ]
+        let projects = HomeProjectGrouping.group(addedPaths: sections.map(\.worktree), resolutions: [:])
+        let tabs = SessionListHomeChrome.filterTabs(
+            projects: projects,
+            sessions: sections.crossProjectSessionListSessions(projects: projects)
+        )
+        let counts = Dictionary(uniqueKeysWithValues: tabs.map { ($0.id, $0.count) })
+
+        #expect(counts["path:/earlier"] == 1)
+        #expect(counts["path:/later"] == 1)
+        #expect(counts["path:/empty-after-dedupe"] == 0)
+        #expect(counts[SessionListFilterTab.allId] == 2)
+    }
+
+    @Test func worktreeSessionStaysInAddedProjectButOpensItsOwnDirectory() {
+        let sessions = [
+            section(
+                worktree: "/repo",
+                session(
+                    id: "ses_worktree",
+                    title: "Add project sheet prototype",
+                    updatedAtEpochMs: 20,
+                    directory: "/worktrees/add-project-browse"
+                )
+            ),
+        ].crossProjectSessionListSessions()
+
+        #expect(sessions.first?.worktree == "path:/repo")
+        #expect(sessions.first?.directory == "/worktrees/add-project-browse")
+    }
+
+    @Test func mergedWorktreesListEachSessionOnceUnderOneProject() {
+        let resolution = HomeProjectResolution(id: "prj", canonical: "/repo", isRepository: true)
+        let sections = [
+            section(
+                worktree: "/repo",
+                session(id: "a", title: "Main", updatedAtEpochMs: 30, directory: "/repo"),
+                session(id: "b", title: "Feature", updatedAtEpochMs: 20, directory: "/repo-wt")
+            ),
+            // v2 lists the whole project for every added worktree.
+            section(
+                worktree: "/repo-wt",
+                session(id: "a", title: "Main", updatedAtEpochMs: 30, directory: "/repo"),
+                session(id: "b", title: "Feature", updatedAtEpochMs: 20, directory: "/repo-wt")
+            ),
+        ]
+        let projects = HomeProjectGrouping.group(
+            addedPaths: ["/repo", "/repo-wt"],
+            resolutions: ["/repo": resolution, "/repo-wt": resolution],
+            branches: ["/repo": "main", "/repo-wt": "feature/b"]
+        )
+
+        let sessions = sections.crossProjectSessionListSessions(projects: projects)
+
+        #expect(sessions.map(\.id) == ["a", "b"])
+        #expect(sessions.map(\.worktree) == ["prj", "prj"])
+        #expect(sessions.map(\.worktreeScopeID) == [
+            HomeScope.worktreeID(projectKey: "prj", directory: "/repo"),
+            HomeScope.worktreeID(projectKey: "prj", directory: "/repo-wt"),
+        ])
+        #expect(sessions.map(\.projectName) == ["repo", "repo"])
+        #expect(sessions[0].location?.parts == [.branch("main")])
+        #expect(sessions[1].location?.parts == [.branch("feature/b"), .text("repo-wt")])
+
+        let scoped = sessions.visibleForFilter(HomeScope.worktreeID(projectKey: "prj", directory: "/repo-wt"))
+        #expect(scoped.map(\.id) == ["b"])
+        #expect(sessions.visibleForFilter("prj").map(\.id) == ["a", "b"])
+    }
+
+    @Test func rowLinesPutProjectAndWorktreeOnSeparateLines() {
+        func row(_ location: HomeRowLocation?, project: String?) -> SessionListSession {
+            SessionListSession(
+                id: "s", title: "T", worktree: "prj", letter: "R", letterAccent: .red,
+                subtitle: "/repo", status: .idle, caption: "",
+                location: location, projectName: project
+            )
+        }
+        let main = row(HomeRowLocation(parts: [.branch("main")]), project: "repo").locationLines
+        #expect(main?.subtitle == [.init(text: "repo", tone: .secondary, icon: .folder)])
+        #expect(main?.detail == [.init(text: "main", tone: .tertiary, icon: .callSplit)])
+
+        let worktree = row(HomeRowLocation(parts: [.branch("feature/b"), .text("repo-wt")]), project: "repo").locationLines
+        #expect(worktree?.subtitle.map(\.text) == ["repo"])
+        #expect(worktree?.detail == [
+            .init(text: "feature/b", tone: .tertiary, icon: .callSplit),
+            .init(text: " \u{00B7} repo-wt", tone: .tertiary),
+        ])
+
+        // Detached HEAD: folder name only, still on its own line.
+        let detached = row(HomeRowLocation(parts: [.text("brave-otter")]), project: "repo").locationLines
+        #expect(detached?.detail == [.init(text: "brave-otter", tone: .tertiary)])
+
+        // Non-git project keeps the path subtitle.
+        #expect(row(nil, project: "notes").locationLines == nil)
+
+        // No project name: the worktree line moves up to the subtitle.
+        let unnamed = row(HomeRowLocation(parts: [.branch("main")]), project: nil).locationLines
+        #expect(unnamed?.subtitle == [.init(text: "main", tone: .secondary, icon: .callSplit)])
+        #expect(unnamed?.detail == nil)
+    }
+
+    @Test func worktreesOffDropsBranchesAndWorktreeScopes() {
+        let resolution = HomeProjectResolution(id: "prj", canonical: "/repo", isRepository: true)
+        let sections = [
+            section(
+                worktree: "/repo",
+                session(id: "a", title: "Main", updatedAtEpochMs: 30, directory: "/repo"),
+                session(id: "b", title: "Feature", updatedAtEpochMs: 20, directory: "/repo-wt")
+            ),
+        ]
+        let projects = HomeProjectGrouping.group(
+            addedPaths: ["/repo"],
+            resolutions: ["/repo": resolution],
+            inventories: ["/repo": ["/repo", "/repo-wt"]],
+            branches: ["/repo": "main", "/repo-wt": "feature/b"]
+        )
+
+        let off = sections.crossProjectSessionListSessions(projects: projects, worktreesEnabled: false)
+        // Every worktree's sessions stay listed under the project, rendered as a plain project.
+        #expect(off.map(\.id) == ["a", "b"])
+        #expect(off.map(\.worktree) == ["prj", "prj"])
+        #expect(off.map(\.worktreeScopeID) == [nil, nil])
+        #expect(off.map(\.location) == [nil, nil])
+        #expect(off.map(\.subtitle) == ["/repo", "/repo"])
+        #expect(off.visibleForFilter("prj").map(\.id) == ["a", "b"])
+        let tabs = SessionListHomeChrome.filterTabs(projects: projects, sessions: off, worktreesEnabled: false)
+        #expect(tabs.map(\.id) == ["prj"])
+
+        // Back on: branches and worktree scopes return from the same inputs.
+        let on = sections.crossProjectSessionListSessions(projects: projects)
+        #expect(on[1].worktreeScopeID == HomeScope.worktreeID(projectKey: "prj", directory: "/repo-wt"))
+        #expect(on[1].location?.parts == [.branch("feature/b"), .text("repo-wt")])
+    }
+
+    @Test func movedSessionRegroupsUnderItsNewWorktree() {
+        let resolution = HomeProjectResolution(id: "prj", canonical: "/repo", isRepository: true)
+        let projects = HomeProjectGrouping.group(
+            addedPaths: ["/repo"],
+            resolutions: ["/repo": resolution],
+            inventories: ["/repo": ["/repo", "/repo-wt"]],
+            branches: ["/repo": "main", "/repo-wt": "feature/b"]
+        )
+        let before = [
+            section(worktree: "/repo", session(id: "a", title: "Moving", updatedAtEpochMs: 30, directory: "/repo")),
+        ].crossProjectSessionListSessions(projects: projects)
+        // The refetch after `session.moved` lists the session in its new directory.
+        let after = [
+            section(worktree: "/repo", session(id: "a", title: "Moving", updatedAtEpochMs: 31, directory: "/repo-wt")),
+        ].crossProjectSessionListSessions(projects: projects)
+
+        let mainScope = HomeScope.worktreeID(projectKey: "prj", directory: "/repo")
+        let featureScope = HomeScope.worktreeID(projectKey: "prj", directory: "/repo-wt")
+        #expect(before.visibleForFilter(mainScope).map(\.id) == ["a"])
+        #expect(after.visibleForFilter(mainScope).isEmpty)
+        #expect(after.visibleForFilter(featureScope).map(\.id) == ["a"])
+        #expect(after[0].directory == "/repo-wt")
+        #expect(after[0].location?.parts == [.branch("feature/b"), .text("repo-wt")])
+    }
+
+    private func section(worktree: String, _ sessions: SessionListItem...) -> ProjectSectionItem {
+        ProjectSectionItem(
+            id: worktree,
+            worktree: worktree,
+            displayName: worktree,
+            pathSubtitle: worktree,
+            letter: "P",
+            letterAccent: .violet,
+            allSessions: sessions,
+            loadError: nil
+        )
+    }
+
+    private func session(
+        id: String,
+        title: String,
+        updatedAtEpochMs: Int64?,
+        directory: String? = nil
+    ) -> SessionListItem {
+        SessionListItem(
+            id: id,
+            title: title,
+            worktree: worktreePlaceholder,
+            updatedAtEpochMs: updatedAtEpochMs,
+            directory: directory
+        )
+    }
+
+    private let worktreePlaceholder = ""
+}

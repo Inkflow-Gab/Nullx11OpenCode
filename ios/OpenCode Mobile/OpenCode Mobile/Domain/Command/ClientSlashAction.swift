@@ -1,0 +1,98 @@
+import Foundation
+
+enum ClientSlashAction: String, Sendable, Equatable, CaseIterable {
+    case new
+    case fork
+    case undo
+    case redo
+    case compact
+    case terminal
+    case files
+    case mcp
+    case btw
+
+    var command: String { rawValue }
+
+    var descriptionText: String {
+        switch self {
+        case .new: "Start a new session"
+        case .fork: "Fork this session"
+        case .undo: "Undo last message"
+        case .redo: "Redo undone message"
+        case .compact: "Compact session context"
+        case .terminal: "Open project shell"
+        case .files: "Browse project files"
+        case .mcp: "Show MCP server status"
+        case .btw: "Ask a side question"
+        }
+    }
+
+    var rowTitle: String { "[\(command)] \(descriptionText)" }
+
+    var tileLabel: String {
+        switch self {
+        case .mcp: "MCP servers"
+        default: command.prefix(1).uppercased() + command.dropFirst()
+        }
+    }
+}
+
+struct ClientSlashMessageRef: Sendable, Equatable {
+    let id: String
+    let isUser: Bool
+    let isPending: Bool
+    let isStreaming: Bool
+    let hasNonEmptyText: Bool
+}
+
+struct ClientSlashActionVisibilityInput: Sendable, Equatable {
+    let visibleUserMessageCount: Int
+    let hasUndoableUserMessage: Bool
+    let hasActiveSessionRevert: Bool
+    let hasSelectedComposerModel: Bool
+    /// The server answers `/btw` side questions (`ServerCapabilities.supportsSideQuestion`).
+    var supportsSideQuestion = false
+}
+
+enum ClientSlashActionCatalog {
+    static func visibleActions(_ input: ClientSlashActionVisibilityInput) -> [ClientSlashAction] {
+        var actions: [ClientSlashAction] = input.supportsSideQuestion ? [.btw] : []
+        actions += [.new, .terminal, .files]
+        if input.visibleUserMessageCount > 0 {
+            actions.append(.fork)
+        }
+        if input.hasUndoableUserMessage {
+            actions.append(.undo)
+        }
+        if input.hasActiveSessionRevert {
+            actions.append(.redo)
+        }
+        if input.visibleUserMessageCount > 0, input.hasSelectedComposerModel {
+            actions.append(.compact)
+        }
+        actions.append(.mcp)
+        return actions
+    }
+
+    static func visibilityInput(
+        messages: [ClientSlashMessageRef],
+        revertMessageID: String?,
+        hasSelectedComposerModel: Bool,
+        supportsSideQuestion: Bool = false
+    ) -> ClientSlashActionVisibilityInput {
+        let visible = messages.filter { message in
+            guard let revertMessageID else { return true }
+            return message.id < revertMessageID
+        }
+        let visibleUsers = visible.filter { message in
+            message.isUser && !message.isPending && !message.isStreaming
+        }
+        return ClientSlashActionVisibilityInput(
+            visibleUserMessageCount: visibleUsers.count,
+            hasUndoableUserMessage: visibleUsers.contains(where: \.hasNonEmptyText),
+            hasActiveSessionRevert: revertMessageID != nil,
+            hasSelectedComposerModel: hasSelectedComposerModel,
+            supportsSideQuestion: supportsSideQuestion
+        )
+    }
+}

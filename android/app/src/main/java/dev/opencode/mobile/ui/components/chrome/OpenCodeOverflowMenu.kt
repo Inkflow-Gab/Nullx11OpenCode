@@ -1,0 +1,392 @@
+package dev.opencode.mobile.ui.components
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
+import dev.opencode.mobile.theme.OpenCodeRadius
+import dev.opencode.mobile.theme.OpenCodeTheme
+import dev.opencode.mobile.theme.openCodeColor
+import dev.opencode.mobile.ui.icons.OpenCodeIcons
+import kotlin.math.roundToInt
+
+private val OverflowMenuCornerRadius = OpenCodeRadius.small
+private val OverflowMenuMinWidth = 200.dp
+private val OverflowMenuPaddingVertical = 4.dp
+private val OverflowMenuEntryMinHeight = 48.dp
+private val OverflowMenuEntryPaddingHorizontal = 12.dp
+private val OverflowMenuEntryIconSize = 20.dp
+private val OverflowMenuEntryIconSpacing = 12.dp
+private val OverflowMenuAnchorEndInset = 4.dp
+private val OverflowMenuAnchorTopOffset = 8.dp
+private val OverflowMenuEntryTextMaxWidth = 240.dp
+
+data class OpenCodeOverflowMenuEntry(
+    val title: String,
+    val icon: ImageVector?,
+    val onClick: () -> Unit,
+    val enabled: Boolean = true,
+    val destructive: Boolean = false,
+    val contentDescription: String? = null,
+    val accessibilityLabel: String? = null,
+    /** Secondary line under the title, such as why the entry is disabled. */
+    val subtitle: String? = null,
+    val testTag: String? = null,
+)
+
+@Composable
+fun OpenCodeTopBarOverflowHost(
+    expanded: Boolean,
+    onDismissRequest: () -> Unit,
+    entries: List<OpenCodeOverflowMenuEntry>,
+    modifier: Modifier = Modifier,
+    topBar: @Composable () -> Unit,
+) {
+    val density = LocalDensity.current
+    val endInsetPx = with(density) { OverflowMenuAnchorEndInset.roundToPx() }
+    val topOffsetPx = with(density) { OverflowMenuAnchorTopOffset.roundToPx() }
+    var topBarBounds by remember { mutableStateOf(androidx.compose.ui.geometry.Rect.Zero) }
+
+    Box(modifier = modifier.fillMaxWidth()) {
+        Box(
+            modifier =
+                Modifier.onGloballyPositioned { coordinates ->
+                    topBarBounds = coordinates.boundsInWindow()
+                },
+        ) {
+            topBar()
+        }
+
+        if (expanded) {
+            val positionProvider =
+                remember(topBarBounds, endInsetPx, topOffsetPx) {
+                    OverflowMenuPopupPositionProvider(
+                        topBarBounds = topBarBounds,
+                        endInsetPx = endInsetPx,
+                        topOffsetPx = topOffsetPx,
+                    )
+                }
+            Popup(
+                popupPositionProvider = positionProvider,
+                onDismissRequest = onDismissRequest,
+                properties =
+                    PopupProperties(
+                        focusable = true,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                        usePlatformDefaultWidth = false,
+                    ),
+            ) {
+                OpenCodeOverflowMenuPanel(
+                    entries = entries,
+                    onDismissRequest = onDismissRequest,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The overflow menu opened from a control inside the content, such as a + button: the panel
+ * sits above [anchor], start-aligned, or below it when there is no room above.
+ */
+@Composable
+fun OpenCodeAnchoredOverflowHost(
+    expanded: Boolean,
+    onDismissRequest: () -> Unit,
+    entries: List<OpenCodeOverflowMenuEntry>,
+    modifier: Modifier = Modifier,
+    anchor: @Composable () -> Unit,
+) {
+    val gapPx = with(LocalDensity.current) { OverflowMenuAnchorTopOffset.roundToPx() }
+    Box(modifier = modifier) {
+        anchor()
+        if (expanded) {
+            Popup(
+                popupPositionProvider = remember(gapPx) { AnchoredOverflowMenuPositionProvider(gapPx) },
+                onDismissRequest = onDismissRequest,
+                properties =
+                    PopupProperties(
+                        focusable = true,
+                        dismissOnBackPress = true,
+                        dismissOnClickOutside = true,
+                        usePlatformDefaultWidth = false,
+                    ),
+            ) {
+                OpenCodeOverflowMenuPanel(
+                    entries = entries,
+                    onDismissRequest = onDismissRequest,
+                )
+            }
+        }
+    }
+}
+
+private class AnchoredOverflowMenuPositionProvider(
+    private val gapPx: Int,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): androidx.compose.ui.unit.IntOffset {
+        val start =
+            if (layoutDirection == LayoutDirection.Ltr) {
+                anchorBounds.left
+            } else {
+                anchorBounds.right - popupContentSize.width
+            }
+        val x = start.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
+        val above = anchorBounds.top - gapPx - popupContentSize.height
+        val y = if (above >= 0) above else anchorBounds.bottom + gapPx
+        return androidx.compose.ui.unit.IntOffset(x, y)
+    }
+}
+
+private class OverflowMenuPopupPositionProvider(
+    private val topBarBounds: androidx.compose.ui.geometry.Rect,
+    private val endInsetPx: Int,
+    private val topOffsetPx: Int,
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize,
+    ): androidx.compose.ui.unit.IntOffset =
+        androidx.compose.ui.unit.IntOffset(
+            x = topBarBounds.right.roundToInt() - popupContentSize.width - endInsetPx,
+            y = topBarBounds.bottom.roundToInt() + topOffsetPx,
+        )
+}
+
+@Composable
+private fun OpenCodeOverflowMenuPanel(
+    entries: List<OpenCodeOverflowMenuEntry>,
+    onDismissRequest: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val reservesIconColumn = entries.any { it.icon != null }
+    Surface(
+        modifier =
+            modifier
+                .wrapContentWidth(Alignment.End)
+                .widthIn(min = OverflowMenuMinWidth),
+        shape = RoundedCornerShape(OverflowMenuCornerRadius),
+        color = openCodeColor("surface-raised-base"),
+        contentColor = openCodeColor("text-strong"),
+        border = BorderStroke(1.dp, openCodeColor("border-weak-base")),
+        shadowElevation = 0.dp,
+    ) {
+        Column(
+            modifier =
+                Modifier
+                    .wrapContentWidth(Alignment.Start)
+                    .widthIn(min = OverflowMenuMinWidth)
+                    .padding(vertical = OverflowMenuPaddingVertical),
+        ) {
+            entries.forEach { entry ->
+                OverflowMenuEntryRow(
+                    entry = entry,
+                    reservesIconColumn = reservesIconColumn,
+                    onDismissRequest = onDismissRequest,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OverflowMenuEntryRow(
+    entry: OpenCodeOverflowMenuEntry,
+    reservesIconColumn: Boolean,
+    onDismissRequest: () -> Unit,
+) {
+    val contentColor =
+        when {
+            !entry.enabled -> openCodeColor("text-weak")
+            entry.destructive -> openCodeColor("error")
+            else -> openCodeColor("text-strong")
+        }
+    val iconColor =
+        when {
+            !entry.enabled -> openCodeColor("icon-base")
+            entry.destructive -> openCodeColor("error")
+            else -> openCodeColor("icon-strong-base")
+        }
+    val interactionSource = remember { MutableInteractionSource() }
+
+    Row(
+        modifier =
+            Modifier
+                .widthIn(min = OverflowMenuMinWidth)
+                .defaultMinSize(minHeight = OverflowMenuEntryMinHeight)
+                .clickable(
+                    enabled = entry.enabled,
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = {
+                        onDismissRequest()
+                        entry.onClick()
+                    },
+                ).padding(
+                    horizontal = OverflowMenuEntryPaddingHorizontal,
+                    vertical = 12.dp,
+                ).then(
+                    entry.accessibilityLabel?.let { label ->
+                        Modifier.semantics(mergeDescendants = true) { contentDescription = label }
+                    } ?: Modifier,
+                ).then(if (entry.enabled) Modifier else Modifier.alpha(0.7f))
+                .then(entry.testTag?.let { Modifier.testTag(it) } ?: Modifier),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement =
+            Arrangement.spacedBy(
+                if (reservesIconColumn) OverflowMenuEntryIconSpacing else 0.dp,
+            ),
+    ) {
+        if (reservesIconColumn) {
+            Box(
+                modifier = Modifier.size(OverflowMenuEntryIconSize),
+                contentAlignment = Alignment.Center,
+            ) {
+                entry.icon?.let { icon ->
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = entry.contentDescription,
+                        modifier = Modifier.size(OverflowMenuEntryIconSize),
+                        tint = iconColor,
+                    )
+                }
+            }
+        }
+        Column(modifier = Modifier.widthIn(max = OverflowMenuEntryTextMaxWidth)) {
+            Text(
+                text = entry.title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = contentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            entry.subtitle?.let { subtitle ->
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = openCodeColor("text-weak"),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+private fun OpenCodeOverflowMenuLightPreview() {
+    OpenCodeTheme(darkTheme = false) {
+        OpenCodeTopBarOverflowHost(
+            expanded = true,
+            onDismissRequest = {},
+            entries = previewOverflowMenuEntries(),
+        ) {
+            OpenCodeTopBar(
+                title = "Session",
+                leading = OpenCodeTopBarLeading.Back(onClick = {}),
+                actions =
+                    listOf(
+                        OpenCodeTopBarAction.Icon(
+                            imageVector = OpenCodeIcons.MoreVert,
+                            contentDescription = "More options",
+                            onClick = {},
+                        ),
+                    ),
+                showDivider = true,
+            )
+        }
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+private fun OpenCodeOverflowMenuDarkPreview() {
+    OpenCodeTheme(darkTheme = true) {
+        OpenCodeTopBarOverflowHost(
+            expanded = true,
+            onDismissRequest = {},
+            entries = previewOverflowMenuEntries(),
+        ) {
+            OpenCodeTopBar(
+                title = "Session",
+                leading = OpenCodeTopBarLeading.Back(onClick = {}),
+                showDivider = true,
+            )
+        }
+    }
+}
+
+private fun previewOverflowMenuEntries(): List<OpenCodeOverflowMenuEntry> =
+    listOf(
+        OpenCodeOverflowMenuEntry(
+            title = "Working tree",
+            icon = OpenCodeIcons.Check,
+            accessibilityLabel = "Working tree, selected",
+            onClick = {},
+        ),
+        OpenCodeOverflowMenuEntry(
+            title = "Main branch",
+            icon = null,
+            onClick = {},
+        ),
+        OpenCodeOverflowMenuEntry(
+            title = "Disabled action",
+            icon = OpenCodeIcons.Settings,
+            enabled = false,
+            subtitle = "Needs an opencode v2 server",
+            onClick = {},
+        ),
+        OpenCodeOverflowMenuEntry(
+            title = "Delete",
+            icon = OpenCodeIcons.Close,
+            destructive = true,
+            onClick = {},
+        ),
+    )

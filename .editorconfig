@@ -1,0 +1,45 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{kt,kts}]
+indent_style = space
+indent_size = 4
+ktlint_function_naming_ignore_when_annotated_with = Composable, Preview
+
+# Message internals stay on package `domain.message` so Screen Models keep
+# product-type imports. Folders are remote / store / pipeline / attachment.
+[**/domain/message/remote/**.kt]
+ktlint_standard_package-name = disabled
+[**/domain/message/store/**.kt]
+ktlint_standard_package-name = disabled
+[**/domain/message/pipeline/**.kt]
+ktlint_standard_package-name = disabled
+[**/domain/message/attachment/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/sessionchat/timeline/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/sessionchat/region/QuestionRequestSupport.kt]
+ktlint_standard_package-name = disabled
+# Component Collection folders stay on package `ui.components`.
+[**/ui/components/chrome/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/components/list/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/components/chat/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/components/input/**.kt]
+ktlint_standard_package-name = disabled
+[**/ui/components/feedback/**.kt]
+ktlint_standard_package-name = disabled
+# Observability files stay on package `dev.opencode.mobile` so call sites keep
+# the existing ProductAnalytics / PrivacyPolicy imports.
+[**/domain/observability/**.kt]
+ktlint_standard_package-name = disabled
+
+[*.swift]
+indent_size = 4

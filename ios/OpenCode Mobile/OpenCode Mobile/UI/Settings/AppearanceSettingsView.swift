@@ -1,0 +1,313 @@
+import SwiftUI
+
+struct AppearanceSettingsView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var themeManager = ThemeManager.shared
+    @State private var showThemePicker = false
+    @State private var showSyntaxPicker = false
+
+    /// Set when shown as the trailing root of the tablet Settings split view.
+    var detailControl: OpenCodeSplitPaneDetailControl? = nil
+
+    var body: some View {
+        VStack(spacing: 0) {
+            OpenCodeTopBar(
+                title: "Appearance",
+                leading: OpenCodeSplitPane.detailLeading(detailControl, back: { dismiss() }),
+                showDivider: true
+            )
+            ScrollView {
+                VStack(spacing: 8) {
+                    OpenCodeListItem(
+                        title: "Theme",
+                        subtitle: "\(themeManager.currentTheme.name) · \(themeBlurb(themeManager.currentTheme.id))",
+                        style: .card,
+                        startDecorator: .icon(.widgets, accessibilityLabel: "Theme"),
+                        accessory: .disclosure,
+                        action: {
+                            ProductAnalytics.logUserAction(
+                                screenId: ProductAnalytics.Screen.settingsAppearance,
+                                actionId: ProductAnalytics.Action.settingsOpenThemePicker
+                            )
+                            showThemePicker = true
+                        }
+                    )
+                    .padding(.horizontal, 16)
+
+                    OpenCodeListItem(
+                        title: "Code highlight",
+                        subtitle: "\(themeManager.currentSyntaxPreset.name) · \(themeManager.currentSyntaxPreset.blurb)",
+                        style: .card,
+                        startDecorator: .icon(.description, accessibilityLabel: "Code highlight"),
+                        accessory: .disclosure,
+                        action: {
+                            ProductAnalytics.logUserAction(
+                                screenId: ProductAnalytics.Screen.settingsAppearance,
+                                actionId: ProductAnalytics.Action.settingsOpenSyntaxPicker
+                            )
+                            showSyntaxPicker = true
+                        }
+                    )
+                    .padding(.horizontal, 16)
+                }
+                .padding(.vertical, 16)
+            }
+            .openCodeReadableColumn()
+        }
+        .navigationBarBackButtonHidden(true)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(OpenCodeColors.backgroundBase)
+        .navigationDestination(isPresented: $showThemePicker) {
+            ThemePickerView()
+        }
+        .navigationDestination(isPresented: $showSyntaxPicker) {
+            SyntaxHighlightPickerView()
+        }
+        .task {
+            ProductAnalytics.logScreenView(
+                screenId: ProductAnalytics.Screen.settingsAppearance,
+                presentation: ProductAnalytics.Presentation.route
+            )
+        }
+    }
+}
+
+struct ThemePickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var themeManager = ThemeManager.shared
+
+    var body: some View {
+        let selectedId = themeManager.currentTheme.id
+        let presets = themeManager.availablePresets()
+        VStack(spacing: 0) {
+            OpenCodeTopBar(
+                title: "Theme",
+                leading: .back(action: { dismiss() }),
+                showDivider: true
+            )
+            ScrollView {
+                VStack(spacing: 12) {
+                    ForEach(presets) { preset in
+                        let preview = themeManager.resolvedPreview(themeId: preset.id)
+                        ThemePreviewCard(
+                            name: preset.name,
+                            blurb: preset.displayBlurb,
+                            selected: preset.id == selectedId,
+                            light: preview?.0,
+                            dark: preview?.1,
+                            action: {
+                                ProductAnalytics.logUserAction(
+                                    screenId: ProductAnalytics.Screen.settingsThemePicker,
+                                    actionId: ProductAnalytics.Action.themePickerSelectPreset,
+                                    parameters: [ProductAnalytics.Param.themePreset: preset.id]
+                                )
+                                themeManager.applyPreset(id: preset.id)
+                            }
+                        )
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
+            }
+            .openCodeReadableColumn()
+        }
+        .navigationBarBackButtonHidden(true)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(OpenCodeColors.backgroundBase)
+        .task {
+            ProductAnalytics.logScreenView(
+                screenId: ProductAnalytics.Screen.settingsThemePicker,
+                presentation: ProductAnalytics.Presentation.route
+            )
+        }
+    }
+}
+
+struct SyntaxHighlightPickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var themeManager = ThemeManager.shared
+
+    var body: some View {
+        let selectedId = themeManager.currentSyntaxPreset.id
+        let presets = themeManager.availableSyntaxPresets()
+        let isDark = colorScheme == .dark
+        VStack(spacing: 0) {
+            OpenCodeTopBar(
+                title: "Code highlight",
+                leading: .back(action: { dismiss() }),
+                showDivider: true
+            )
+            ScrollView {
+                VStack(spacing: 12) {
+                    ForEach(presets) { preset in
+                        SyntaxPreviewCard(
+                            preset: preset,
+                            selected: preset.id == selectedId,
+                            tokens: themeManager.syntaxTokensForPreview(preset: preset, isDark: isDark),
+                            action: {
+                                ProductAnalytics.logUserAction(
+                                    screenId: ProductAnalytics.Screen.settingsSyntaxPicker,
+                                    actionId: ProductAnalytics.Action.syntaxPickerSelectPreset,
+                                    parameters: [ProductAnalytics.Param.syntaxPreset: preset.id]
+                                )
+                                themeManager.applySyntaxPreset(id: preset.id)
+                            }
+                        )
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
+            }
+            .openCodeReadableColumn()
+        }
+        .navigationBarBackButtonHidden(true)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(OpenCodeColors.backgroundBase)
+        .task {
+            ProductAnalytics.logScreenView(
+                screenId: ProductAnalytics.Screen.settingsSyntaxPicker,
+                presentation: ProductAnalytics.Presentation.route
+            )
+        }
+    }
+}
+
+private struct ThemePreviewCard: View {
+    let name: String
+    let blurb: String
+    let selected: Bool
+    let light: ResolvedTokens?
+    let dark: ResolvedTokens?
+    let action: () -> Void
+
+    var body: some View {
+        OpenCodeSelectableCard(title: name, blurb: blurb, selected: selected, action: action) {
+            HStack(spacing: 8) {
+                MiniThemePane(label: "Light", tokens: light)
+                MiniThemePane(label: "Dark", tokens: dark)
+            }
+        }
+    }
+}
+
+private struct MiniThemePane: View {
+    let label: String
+    let tokens: ResolvedTokens?
+
+    var body: some View {
+        let background = tokenColor(tokens, "background-base")
+        let raised = tokenColor(tokens, "surface-raised-base")
+        let wash = tokenColor(tokens, "surface-interactive-weak")
+        let ink = tokenColor(tokens, "text-strong")
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(OpenCodeTypography.caption)
+                .foregroundStyle(ink)
+            Text("Walk the token store.")
+                .font(OpenCodeTypography.caption)
+                .foregroundStyle(ink)
+                .lineLimit(1)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .background(wash, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(.leading, 28)
+            Text("Refreshing once, then retry.")
+                .font(OpenCodeTypography.caption)
+                .foregroundStyle(ink)
+                .lineLimit(2)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(raised, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(background, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct SyntaxPreviewCard: View {
+    let preset: SyntaxHighlightPreset
+    let selected: Bool
+    let tokens: [String: String]
+    let action: () -> Void
+
+    var body: some View {
+        OpenCodeSelectableCard(title: preset.name, blurb: preset.blurb, selected: selected, action: action) {
+            OpenCodeCodeSnippet(syntaxSnippet(tokens), surface: .syntaxPreset(tokens))
+        }
+    }
+}
+
+private func tokenColor(_ tokens: ResolvedTokens?, _ key: String) -> Color {
+    Color(hex: tokens?.tokens[key] ?? "#888888")
+}
+
+/// A short sample with every colored role, drawn through the same role table as code in chat.
+private let syntaxSample: [(String, NativeCodeTokenRole)] = [
+    ("// refresh before the request\n", .comment),
+    ("async function ", .keyword),
+    ("read", .function),
+    ("(", .punctuation),
+    ("s", .variable),
+    (": ", .punctuation),
+    ("Store", .type),
+    (") {\n  ", .punctuation),
+    ("if ", .keyword),
+    ("(", .punctuation),
+    ("s", .variable),
+    (".", .punctuation),
+    ("expired", .function),
+    ("()) {\n    ", .punctuation),
+    ("await ", .keyword),
+    ("refresh", .function),
+    ("(", .punctuation),
+    ("\"access\"", .string),
+    (", ", .punctuation),
+    ("3", .number),
+    (");\n  }\n  ", .punctuation),
+    ("return ", .keyword),
+    ("s", .variable),
+    (".", .punctuation),
+    ("token", .property),
+    (";\n}", .punctuation),
+]
+
+private func syntaxSnippet(_ tokens: [String: String]) -> AttributedString {
+    var result = AttributedString()
+    for (text, role) in syntaxSample {
+        var part = AttributedString(text)
+        // Match theme previews carry only syntax tokens; plain text then uses the theme's own.
+        part.foregroundColor = OpenCodeCodeColors.hex(for: role, in: tokens).map(Color.init(hex:))
+            ?? OpenCodeColors.textStrong
+        result.append(part)
+    }
+    return result
+}
+
+private extension ThemePreset {
+    var displayBlurb: String {
+        blurb.isEmpty ? themeBlurb(id) : blurb
+    }
+}
+
+private func themeBlurb(_ id: String) -> String {
+    switch id {
+    case "porcelain": "Near-white / near-black"
+    case "linen": "Warm paper / espresso"
+    case "signal": "True white / true black"
+    case "hotline": "Neutral chrome, loud pink"
+    case "phosphor": "Neutral chrome, CRT green"
+    default: id
+    }
+}
+
+#Preview {
+    NavigationStack {
+        AppearanceSettingsView()
+    }
+    .openCodeTheme()
+}

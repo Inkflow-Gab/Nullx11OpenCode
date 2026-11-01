@@ -1,0 +1,835 @@
+package dev.opencode.mobile.domain.message
+
+import dev.opencode.mobile.markdown.CodeSpan
+import dev.opencode.mobile.markdown.MarkdownBlock
+import dev.opencode.mobile.markdown.MarkdownDocument
+import dev.opencode.mobile.markdown.OpenCodeMarkdownDetector
+import dev.opencode.mobile.markdown.stableMarkdownSourceHash
+import dev.opencode.mobile.ui.sessionchat.PresentationBlockId
+import dev.opencode.mobile.ui.sessionchat.SessionChatTimelineBlock
+import dev.opencode.mobile.ui.sessionchat.SessionChatTimelineBlocks
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
+import kotlin.time.TimeSource
+
+/** Open window that coalesces a burst of streaming tokens into one UI frame. */
+internal const val STREAMING_PREPARE_DEBOUNCE_MS = 80L
+
+/** Cap how long dense SSE bursts can delay a UI publish. Keep flat so long replies
+ * do not intentionally slow down as they grow. */
+internal const val STREAMING_PREPARE_MAX_BATCH_MS = 160L
+
+class DisplayMessagePipeline(
+    private val snapshotSource: DisplayMessageSnapshotSource,
+    private val contentPreparer: DisplayMessagePreparing,
+    private val timeSource: TimeSource = TimeSource.Monotonic,
+    private val delayMillis: suspend (Long) -> Unit = { delay(it) },
+    private val messageSync: MessageSync? = null,
+) {
+    constructor(
+        messageSync: MessageSync,
+        contentPreparer: MessageContentPreparer,
+        timeSource: TimeSource = TimeSource.Monotonic,
+        delayMillis: suspend (Long) -> Unit = { delay(it) },
+    ) : this(
+        snapshotSource = messageSync.asDisplayMessageSnapshotSource(),
+        contentPreparer = contentPreparer.asDisplayMessagePreparing(),
+        timeSource = timeSource,
+        delayMillis = delayMillis,
+        messageSync = messageSync,
+    )
+
+    fun observeDisplayMessages(
+        sessionId: String,
+        directory: String?,
+    ): Flow<DisplayMessageListUpdate> =
+        channelFlow {
+            var previousById = emptyMap<String, DisplayMessage>()
+            var pendingMessages: List<Message>? = null
+            var lastPublishedMessages: List<Message>? = null
+            var currentGeneration = 0L
+            var debounceJob: Job? = null
+            var prepareJob: Job? = null
+            var enrichmentJob: Job? = null
+            var highlightJob: Job? = null
+            var highlightEpoch = 0L
+            val streamingDocs = mutableMapOf<String, MarkdownDocument>()
+            var lastPublishedAt: kotlin.time.TimeMark? = null
+            // True while coalescing a live streaming reply (including in-flight prepare).
+            var isStreamingSession = false
+            var sourceIsFromCache = false
+
+            var sourceHasOlder = false
+
+            suspend fun emitDisplayMessages(messages: List<DisplayMessage>) {
+                send(
+                    DisplayMessageListUpdate.Messages(
+                        messages = messages,
+                        isFromCache = sourceIsFromCache,
+                        hasOlder = sourceHasOlder,
+                    ),
+                )
+            }
+
+            fun invalidateInFlightWork() {
+                debounceJob?.cancel()
+                debounceJob = null
+                prepareJob?.cancel()
+                prepareJob = null
+                enrichmentJob?.cancel()
+                enrichmentJob = null
+                highlightJob?.cancel()
+                highlightJob = null
+            }
+
+            fun nextGeneration(): Long {
+                currentGeneration += 1
+                return currentGeneration
+            }
+
+            fun isCurrent(generation: Long): Boolean = generation == currentGeneration
+
+            fun commitPrepared(
+                generation: Long,
+                prepared: List<DisplayMessage>,
+                mode: MessagePreparationMode,
+            ): Boolean {
+                if (!isCurrent(generation)) return false
+                if (mode.replacesPreparedCache) {
+                    previousById = prepared.associateBy { it.id }
+                } else {
+                    for (display in prepared) {
+                        if (display.renderedMarkdown != null) {
+                            previousById = previousById + (display.id to display)
+                        }
+                    }
+                }
+                lastPublishedAt = timeSource.markNow()
+                return true
+            }
+
+            suspend fun buildStructureFirstStreamingFrame(messages: List<Message>): List<DisplayMessage> {
+                streamingDocs.retainStillStreaming(messages)
+                val out = ArrayList<DisplayMessage>(messages.size)
+                for (message in messages) {
+                    val previous = previousById[message.id]
+                    if (!messageHasStreamingText(message)) {
+                        out +=
+                            when {
+                                previous != null &&
+                                    previous.text == message.text &&
+                                    previous.renderedMarkdown != null ->
+                                    // Preserve upgrade metadata so concurrent streams do not
+                                    // clear HistoryPlainFirst / enrichment pending flags.
+                                    previous.copy(message = message)
+                                else -> DisplayMessage(message = message, renderedMarkdown = null)
+                            }
+                        continue
+                    }
+                    val target = resolveStreamingDecorationTarget(message)
+                    val parsed =
+                        if (target != null && OpenCodeMarkdownDetector.shouldRender(target.plain)) {
+                            contentPreparer.prepareStructureOnlyTextBlock(
+                                blockID = target.blockID,
+                                plain = target.plain,
+                                sessionKey = sessionId,
+                            )
+                        } else {
+                            null
+                        }
+                    val structure = parsed?.carryingCodeSpans(streamingDocs[message.id])
+                    if (structure != null) {
+                        streamingDocs[message.id] = structure
+                    }
+                    if (structure != null && target != null) {
+                        BlockDecorationCache.put(
+                            sessionKey = sessionId,
+                            blockID = target.blockID,
+                            textHash = target.textHash,
+                            textLength = target.textLength,
+                            isStreaming = true,
+                            document = structure,
+                        )
+                    }
+                    val awaitingColors = structure?.hasUncoloredCodeFence() == true
+                    out +=
+                        DisplayMessage(
+                            message = message,
+                            renderedMarkdown = structure.takeIf { messageHasSoleTextBlock(message) },
+                            awaitingTextMateUpgrade = awaitingColors,
+                        )
+                }
+                return out
+            }
+
+            suspend fun applyStreamingColors(
+                messageId: String,
+                target: StreamingDecorationTarget,
+                document: MarkdownDocument,
+                partial: Boolean,
+            ) {
+                if (!isCurrent(currentGeneration)) return
+                streamingDocs[messageId] = document
+                BlockDecorationCache.put(
+                    sessionKey = sessionId,
+                    blockID = target.blockID,
+                    textHash = target.textHash,
+                    textLength = target.textLength,
+                    isStreaming = true,
+                    document = document,
+                )
+                val messages = lastPublishedMessages ?: return
+                val frame =
+                    messages.map { message ->
+                        if (message.id != messageId) {
+                            previousById[message.id]?.copy(message = message)
+                                ?: DisplayMessage(message = message, renderedMarkdown = null)
+                        } else {
+                            DisplayMessage(
+                                message = message,
+                                renderedMarkdown = document.takeIf { messageHasSoleTextBlock(message) },
+                                awaitingTextMateUpgrade = partial,
+                            )
+                        }
+                    }
+                previousById = frame.associateBy { it.id }
+                emitDisplayMessages(frame)
+            }
+
+            fun scheduleStreamingHighlight(
+                generation: Long,
+                messages: List<Message>,
+            ) {
+                highlightJob?.cancel()
+                highlightEpoch += 1
+                val epoch = highlightEpoch
+                val targets =
+                    messages.mapNotNull { message ->
+                        if (!messageHasStreamingText(message)) return@mapNotNull null
+                        val target = resolveStreamingDecorationTarget(message) ?: return@mapNotNull null
+                        if (!OpenCodeMarkdownDetector.shouldRender(target.plain)) return@mapNotNull null
+                        if (streamingDocs[message.id]?.hasCodeFence() != true) return@mapNotNull null
+                        message.id to target
+                    }
+                if (targets.isEmpty()) return
+                highlightJob =
+                    launch {
+                        for ((messageId, target) in targets) {
+                            var partial = true
+                            var stalled = false
+                            while (partial) {
+                                ensureActive()
+                                if (!isCurrent(generation) || highlightEpoch != epoch) return@launch
+                                val highlighted =
+                                    contentPreparer.highlightStreamingTextBlock(
+                                        blockID = target.blockID,
+                                        plain = target.plain,
+                                        sessionKey = sessionId,
+                                    ) ?: break
+                                if (!isCurrent(generation) || highlightEpoch != epoch) return@launch
+                                val latest = lastPublishedMessages?.find { it.id == messageId }
+                                val currentPlain = latest?.let { resolveStreamingDecorationTarget(it)?.plain }
+                                if (currentPlain != target.plain) break
+                                val previous = streamingDocs[messageId]
+                                val unchanged = previous != null && previous.hasSameCodeSpans(highlighted.document)
+                                if (unchanged && (!highlighted.partial || stalled)) break
+                                stalled = unchanged
+                                if (!unchanged) {
+                                    applyStreamingColors(
+                                        messageId = messageId,
+                                        target = target,
+                                        document = highlighted.document,
+                                        partial = highlighted.partial,
+                                    )
+                                }
+                                partial = highlighted.partial
+                            }
+                        }
+                    }
+            }
+
+            suspend fun publishPlainStreamingFrame(
+                generation: Long,
+                messages: List<Message>,
+            ) {
+                if (!isCurrent(generation)) return
+                val frame = buildStructureFirstStreamingFrame(messages)
+                previousById = frame.associateBy { it.id }
+                lastPublishedMessages = messages
+                lastPublishedAt = timeSource.markNow()
+                emitDisplayMessages(frame)
+                scheduleStreamingHighlight(generation, messages)
+            }
+
+            fun isDueForMaxBatch(): Boolean {
+                return lastPublishedAt
+                    ?.elapsedNow()
+                    ?.inWholeMilliseconds
+                    ?.let { it >= STREAMING_PREPARE_MAX_BATCH_MS }
+                    ?: true
+            }
+
+            fun scheduleStreamingPublish(generation: Long) {
+                if (debounceJob?.isActive == true) return
+                debounceJob =
+                    launch {
+                        delayMillis(STREAMING_PREPARE_DEBOUNCE_MS)
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        val latest = pendingMessages ?: return@launch
+                        pendingMessages = null
+                        publishPlainStreamingFrame(generation, latest)
+                        // Catch up if denser tokens arrived during this plain publish.
+                        val catchUp = pendingMessages
+                        if (catchUp != null && hasStreamingDelta(catchUp)) {
+                            if (isDueForMaxBatch()) {
+                                pendingMessages = null
+                                publishPlainStreamingFrame(currentGeneration, catchUp)
+                            } else {
+                                scheduleStreamingPublish(currentGeneration)
+                            }
+                        }
+                    }
+            }
+
+            fun scheduleFinalization(
+                generation: Long,
+                messages: List<Message>,
+            ) {
+                prepareJob?.cancel()
+                prepareJob =
+                    launch {
+                        val snapshot = previousById
+                        val placeholder =
+                            contentPreparer.prepareMessages(
+                                messages,
+                                snapshot,
+                                MessagePreparationMode.FinalPlaceholder,
+                            )
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        if (!commitPrepared(generation, placeholder, MessagePreparationMode.FinalPlaceholder)) {
+                            return@launch
+                        }
+                        lastPublishedMessages = messages
+                        emitDisplayMessages(placeholder)
+
+                        val finalized =
+                            contentPreparer.prepareMessages(
+                                messages,
+                                // Use pre-placeholder snapshot so Final does not
+                                // settle-reuse streaming-quality spans via the
+                                // placeholder DisplayMessage (isStreaming=false).
+                                snapshot,
+                                MessagePreparationMode.Final,
+                            )
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        if (!commitPrepared(generation, finalized, MessagePreparationMode.Final)) return@launch
+                        lastPublishedMessages = messages
+                        emitDisplayMessages(finalized)
+                    }
+            }
+
+            fun enrichHistoryInBackground(
+                generation: Long,
+                messages: List<Message>,
+            ) {
+                enrichmentJob?.cancel()
+                enrichmentJob =
+                    launch {
+                        val holdReady = MessageContentPreparer.HOLD_READY_UNTIL_NEWEST_MARKDOWN
+                        // Spinner is already up when holding Ready — start highlighting ASAP.
+                        if (!holdReady) {
+                            delayMillis(48)
+                        }
+                        if (!isActive || !isCurrent(generation)) return@launch
+
+                        val byId =
+                            messages
+                                .associate { message ->
+                                    message.id to
+                                        (
+                                            previousById[message.id]?.takeIf { it.text == message.text }
+                                                ?: DisplayMessage(message = message, renderedMarkdown = null)
+                                        )
+                                }.toMutableMap()
+                        var enrichedCount = 0
+                        var viewportEnrichedCount = 0
+                        var viewportCharactersRemaining =
+                            MessageContentPreparer.HISTORY_ENRICH_VIEWPORT_CHARACTER_BUDGET
+                        var publishedViewport = false
+
+                        suspend fun publishSnapshot() {
+                            if (!isCurrent(generation)) return
+                            previousById = byId.toMap()
+                            lastPublishedMessages = messages
+                            lastPublishedAt = timeSource.markNow()
+                            emitDisplayMessages(messages.map { byId.getValue(it.id) })
+                        }
+
+                        // Newest first: open settles near the bottom, so enrich what the
+                        // user is looking at before older off-screen history.
+                        for (message in messages.asReversed()) {
+                            ensureActive()
+                            if (!isCurrent(generation)) return@launch
+                            if (!OpenCodeMarkdownDetector.shouldRender(message.text)) continue
+                            val cached = byId[message.id]
+                            if (cached?.renderedMarkdown != null &&
+                                cached.text == message.text &&
+                                !cached.awaitingTextMateUpgrade
+                            ) {
+                                continue
+                            }
+                            val prepared =
+                                contentPreparer.prepareMessage(
+                                    message,
+                                    previous = byId[message.id],
+                                    mode = MessagePreparationMode.HistoryEnrichment,
+                                )
+                            if (!isActive || !isCurrent(generation)) return@launch
+                            byId[message.id] = prepared
+                            previousById = previousById + (message.id to prepared)
+                            enrichedCount += 1
+
+                            if (!publishedViewport) {
+                                viewportEnrichedCount += 1
+                                viewportCharactersRemaining -= message.text.length
+                                val viewportReady =
+                                    holdReady ||
+                                        viewportEnrichedCount >=
+                                        MessageContentPreparer.HISTORY_ENRICH_VIEWPORT_MESSAGE_COUNT ||
+                                        viewportCharactersRemaining <= 0
+                                if (viewportReady) {
+                                    publishSnapshot()
+                                    publishedViewport = true
+                                }
+                            }
+                            // Cooperative cancel point while preparing the remaining batch.
+                            yield()
+                        }
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        // Escape hatch: hold path must not leave the UI on Loading forever.
+                        if (holdReady && !publishedViewport) {
+                            publishSnapshot()
+                            return@launch
+                        }
+                        if (enrichedCount == 0) return@launch
+                        if (!publishedViewport || enrichedCount > viewportEnrichedCount) {
+                            publishSnapshot()
+                        }
+                    }
+            }
+
+            fun schedulePrepare(
+                generation: Long,
+                messages: List<Message>,
+                mode: MessagePreparationMode,
+                onCommitted: (() -> Unit)? = null,
+            ) {
+                prepareJob?.cancel()
+                prepareJob =
+                    launch {
+                        val snapshot = previousById
+                        val prepared =
+                            contentPreparer.prepareMessages(
+                                messages,
+                                snapshot,
+                                mode,
+                            )
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        if (!commitPrepared(generation, prepared, mode)) return@launch
+                        lastPublishedMessages = messages
+                        // Format-first history is publishable; do not hold Ready on
+                        // unprocessed plain while highlighting enrichment catches up.
+                        emitDisplayMessages(prepared)
+                        onCommitted?.invoke()
+                    }
+            }
+
+            /**
+             * HistoryPlainFirst newest-first: format the bottom message first and
+             * publish immediately, then fill the rest of history.
+             */
+            fun schedulePlainFirstNewestFirst(
+                generation: Long,
+                messages: List<Message>,
+                onCommitted: (() -> Unit)? = null,
+            ) {
+                prepareJob?.cancel()
+                prepareJob =
+                    launch {
+                        val byId =
+                            messages
+                                .associate { message ->
+                                    val previous = previousById[message.id]?.takeIf { it.text == message.text }
+                                    message.id to (
+                                        previous
+                                            ?: DisplayMessage(message = message, renderedMarkdown = null)
+                                    )
+                                }.toMutableMap()
+
+                        suspend fun publish(label: String) {
+                            if (!isCurrent(generation)) return
+                            val frame = messages.map { byId.getValue(it.id) }
+                            if (!commitPrepared(generation, frame, MessagePreparationMode.HistoryPlainFirst)) {
+                                return
+                            }
+                            lastPublishedMessages = messages
+                            lastPublishedAt = timeSource.markNow()
+                            emitDisplayMessages(frame)
+                        }
+
+                        // Phase 1: newest markdown message only — what the open
+                        // viewport shows — then publish before older history.
+                        val newestMarkdown =
+                            messages.asReversed().firstOrNull {
+                                OpenCodeMarkdownDetector.shouldRender(it.text)
+                            }
+                        if (newestMarkdown != null) {
+                            val prepared =
+                                contentPreparer.prepareMessage(
+                                    message = newestMarkdown,
+                                    previous = byId[newestMarkdown.id],
+                                    mode = MessagePreparationMode.HistoryPlainFirst,
+                                )
+                            if (!isActive || !isCurrent(generation)) return@launch
+                            byId[newestMarkdown.id] = prepared
+                            previousById = previousById + (newestMarkdown.id to prepared)
+                            publish("plain-first-newest")
+                        }
+
+                        // Phase 2: remaining HistoryPlainFirst (reuses newest).
+                        val phase2 =
+                            contentPreparer.prepareMessages(
+                                messages,
+                                byId,
+                                MessagePreparationMode.HistoryPlainFirst,
+                            )
+                        if (!isActive || !isCurrent(generation)) return@launch
+                        for (display in phase2) {
+                            byId[display.id] = display
+                        }
+                        previousById = byId.toMap()
+                        publish("plain-first-rest")
+                        onCommitted?.invoke()
+                    }
+            }
+
+            try {
+                snapshotSource.observeMessages(sessionId, directory).collect { update ->
+                    when (update) {
+                        is MessageListUpdate.LoadFailed -> {
+                            nextGeneration()
+                            invalidateInFlightWork()
+                            pendingMessages = null
+                            lastPublishedMessages = null
+                            isStreamingSession = false
+                            streamingDocs.clear()
+                            BlockDecorationCache.clear()
+                            send(DisplayMessageListUpdate.LoadFailed(update.error))
+                        }
+                        is MessageListUpdate.CacheSyncConfirmed -> {
+                            // Network agreed with the cache. Clear the flag so in-flight
+                            // plain-first / enrichment publishes cannot re-raise Syncing.
+                            sourceIsFromCache = false
+                            sourceHasOlder = update.hasOlder
+                            send(DisplayMessageListUpdate.CacheSyncConfirmed(hasOlder = update.hasOlder))
+                        }
+                        is MessageListUpdate.Messages -> {
+                            val previousSourceIsFromCache = sourceIsFromCache
+                            sourceIsFromCache = update.isFromCache
+                            sourceHasOlder = update.hasOlder
+                            if (hasStreamingDelta(update.messages)) {
+                                // Coalesce streaming tokens into pendingMessages. Do not bump
+                                // generation on every delta — decoration stays generation-gated
+                                // and rejects on text-identity mismatch within the session.
+                                if (!isStreamingSession) {
+                                    isStreamingSession = true
+                                    nextGeneration()
+                                    invalidateInFlightWork()
+                                } else {
+                                    enrichmentJob?.cancel()
+                                    enrichmentJob = null
+                                    // Keep the open coalesce window. Later deltas replace
+                                    // pendingMessages instead of restarting the quiet timer.
+                                }
+                                pendingMessages = update.messages
+                                if (isDueForMaxBatch()) {
+                                    debounceJob?.cancel()
+                                    debounceJob = null
+                                    val latest = pendingMessages ?: update.messages
+                                    pendingMessages = null
+                                    publishPlainStreamingFrame(currentGeneration, latest)
+                                } else {
+                                    scheduleStreamingPublish(currentGeneration)
+                                }
+                            } else {
+                                if (!sourceIsFromCache &&
+                                    lastPublishedMessages != null &&
+                                    update.messages == lastPublishedMessages
+                                ) {
+                                    // A network frame identical to the cache-seeded one confirms
+                                    // the cache; skipping it silently would leave Syncing… up.
+                                    if (previousSourceIsFromCache) {
+                                        send(DisplayMessageListUpdate.CacheSyncConfirmed(hasOlder = update.hasOlder))
+                                    }
+                                    return@collect
+                                }
+                                val generation = nextGeneration()
+                                invalidateInFlightWork()
+                                pendingMessages = null
+                                isStreamingSession = false
+                                streamingDocs.retainStillStreaming(update.messages)
+                                val hadStreamingPrevious = previousById.values.any { it.isStreaming }
+                                if (hadStreamingPrevious) {
+                                    scheduleFinalization(generation, update.messages)
+                                } else if (sourceIsFromCache ||
+                                    shouldPlainFirstHistoryPublish(update.messages, previousById)
+                                ) {
+                                    // Newest-first HistoryPlainFirst: format the open
+                                    // viewport (last message) before older history.
+                                    // Skip null-markdown flash. REST identity-unchanged
+                                    // keeps highlighting enrichment from being cancelled.
+                                    schedulePlainFirstNewestFirst(
+                                        generation = generation,
+                                        messages = update.messages,
+                                        onCommitted = {
+                                            if (isCurrent(generation)) {
+                                                enrichHistoryInBackground(generation, update.messages)
+                                            }
+                                        },
+                                    )
+                                } else {
+                                    schedulePrepare(generation, update.messages, MessagePreparationMode.Final)
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                // Teardown cancels and drops unpublished work. No flush contract.
+                invalidateInFlightWork()
+                pendingMessages = null
+            }
+        }
+
+    suspend fun refreshDisplayMessages(
+        sessionId: String,
+        directory: String?,
+    ): List<DisplayMessage> {
+        val sync =
+            messageSync
+                ?: error("refreshDisplayMessages requires a MessageSync-backed pipeline")
+        val messages = sync.refreshMessages(sessionId, directory)
+        return contentPreparer.prepareMessages(messages, mode = MessagePreparationMode.Final)
+    }
+
+    suspend fun loadOlderDisplayMessages(
+        sessionId: String,
+        directory: String?,
+    ): OlderDisplayLoadResult {
+        val sync =
+            messageSync
+                ?: error("loadOlderDisplayMessages requires a MessageSync-backed pipeline")
+        val result = sync.loadOlderMessages(sessionId, directory)
+        if (result.addedCount == 0) {
+            return OlderDisplayLoadResult(
+                messages = emptyList(),
+                hasOlder = result.hasOlder,
+                addedCount = 0,
+            )
+        }
+        val prepared =
+            contentPreparer.prepareMessages(
+                result.messages,
+                mode = MessagePreparationMode.Final,
+            )
+        return OlderDisplayLoadResult(
+            messages = prepared,
+            hasOlder = result.hasOlder,
+            addedCount = result.addedCount,
+        )
+    }
+
+    private fun hasStreamingDelta(messages: List<Message>): Boolean = messages.any(::messageHasStreamingText)
+}
+
+private fun messageHasStreamingText(message: Message): Boolean = message.parts.any { part -> part is MessagePart.Text && part.isStreaming }
+
+/** Drops the live documents of messages in [messages] that stopped streaming or are gone. */
+internal fun MutableMap<String, MarkdownDocument>.retainStillStreaming(messages: List<Message>) {
+    if (isEmpty()) return
+    val streaming = messages.filter(::messageHasStreamingText).mapTo(HashSet()) { it.id }
+    keys.retainAll(streaming)
+}
+
+internal data class StreamingDecorationTarget(
+    val blockID: String,
+    val plain: String,
+    val textHash: Int,
+    val textLength: Int,
+    val isStreaming: Boolean,
+)
+
+/**
+ * Resolve the streaming text presentation block for decoration.
+ *
+ * Matches [SessionChatTimelineBlocks] text-run boundaries: visible tools and
+ * file parts flush a run; invisible tools (e.g. todowrite) do not. Prefer the
+ * last run that still contains streaming text — the active block the user is
+ * watching — then fall back to [PresentationBlockId.messageFallback].
+ */
+internal fun resolveStreamingDecorationTarget(message: Message): StreamingDecorationTarget? {
+    if (!messageHasStreamingText(message)) return null
+    val allowToolCards = message.role == MessageRole.Assistant
+    val runs = mutableListOf<List<Pair<MessagePart.Text, String>>>()
+    var current = mutableListOf<Pair<MessagePart.Text, String>>()
+
+    fun flush() {
+        if (current.isEmpty()) return
+        runs += current.toList()
+        current = mutableListOf()
+    }
+
+    for (part in message.parts) {
+        when (part) {
+            is MessagePart.Text -> {
+                val trimmed = part.text.trim()
+                if (trimmed.isEmpty()) continue
+                if (part.id == null) {
+                    flush()
+                    continue
+                }
+                current += part to trimmed
+            }
+            is MessagePart.Tool -> {
+                if (!allowToolCards || !isVisibleToolForStreamingDecoration(part)) continue
+                flush()
+            }
+            is MessagePart.File,
+            is MessagePart.Compaction,
+            is MessagePart.Reasoning,
+            is MessagePart.Notice,
+            -> flush()
+        }
+    }
+    flush()
+
+    val selected =
+        runs.lastOrNull { run -> run.any { (textPart, _) -> textPart.isStreaming } }
+    if (selected == null) {
+        return StreamingDecorationTarget(
+            blockID = PresentationBlockId.messageFallback(message.id),
+            plain = message.text,
+            textHash = stableMarkdownSourceHash(message.text),
+            textLength = message.text.length,
+            isStreaming = true,
+        )
+    }
+    val partIds = selected.mapNotNull { (textPart, _) -> textPart.id }
+    val plain = selected.joinToString("\n") { it.second }
+    return StreamingDecorationTarget(
+        blockID = PresentationBlockId.mergedText(partIds),
+        plain = plain,
+        textHash = stableMarkdownSourceHash(plain),
+        textLength = plain.length,
+        isStreaming = true,
+    )
+}
+
+/** Mirrors [SessionChatTimelineBlocks] visibility used when flushing text runs. */
+private fun isVisibleToolForStreamingDecoration(tool: MessagePart.Tool): Boolean = ToolPartIdentity.isVisibleOnTimeline(tool)
+
+/** Copies stable fence colors onto a newly parsed structure so a growing stream does not flash plain. */
+internal fun MarkdownDocument.carryingCodeSpans(from: MarkdownDocument?): MarkdownDocument {
+    if (from == null) return this
+    val previous = from.blocks.filterIsInstance<MarkdownBlock.CodeBlock>()
+    if (previous.isEmpty()) return this
+    var fence = 0
+    var changed = false
+    val updated =
+        blocks.map { block ->
+            if (block !is MarkdownBlock.CodeBlock) return@map block
+            val old = previous.getOrNull(fence) ?: return@map block
+            fence += 1
+            val carried = carryCodeSpans(oldCode = old.code, oldSpans = old.spans, newCode = block.code)
+            if (carried.isEmpty() || carried == block.spans) return@map block
+            changed = true
+            block.copy(spans = carried)
+        }
+    return if (changed) copy(blocks = updated) else this
+}
+
+internal fun carryCodeSpans(
+    oldCode: String,
+    oldSpans: List<CodeSpan>,
+    newCode: String,
+): List<CodeSpan> {
+    if (oldSpans.isEmpty()) return emptyList()
+    if (newCode == oldCode) return oldSpans
+    if (!newCode.startsWith(oldCode)) return emptyList()
+    val limit = oldCode.length
+    return oldSpans.filter { span -> span.start >= 0 && span.end <= limit && span.start < span.end }
+}
+
+internal fun MarkdownDocument.hasCodeFence(): Boolean = blocks.any { it is MarkdownBlock.CodeBlock }
+
+/** A fence the streaming pass still needs to color. Carried spans do not count as uncolored. */
+internal fun MarkdownDocument.hasUncoloredCodeFence(): Boolean =
+    blocks.filterIsInstance<MarkdownBlock.CodeBlock>().any { block -> block.spans.isEmpty() && block.code.isNotEmpty() }
+
+internal fun MarkdownDocument.hasSameCodeSpans(other: MarkdownDocument): Boolean {
+    val left = blocks.filterIsInstance<MarkdownBlock.CodeBlock>()
+    val right = other.blocks.filterIsInstance<MarkdownBlock.CodeBlock>()
+    if (left.size != right.size) return false
+    return left.zip(right).all { (a, b) -> a.code == b.code && a.spans == b.spans }
+}
+
+private fun messageHasSoleTextBlock(message: Message): Boolean {
+    val blocks =
+        SessionChatTimelineBlocks.buildOrFallback(
+            role = message.role,
+            parts = message.parts,
+            messageId = message.id,
+            fallbackText = message.text,
+        )
+    return blocks.count { it is SessionChatTimelineBlock.Text } == 1
+}
+
+internal fun shouldPlainFirstHistoryPublish(
+    messages: List<Message>,
+    previousById: Map<String, DisplayMessage>,
+): Boolean {
+    if (previousById.values.any { it.renderedMarkdown != null }) return false
+    var markdownChars = 0
+    for (message in messages) {
+        if (!OpenCodeMarkdownDetector.shouldRender(message.text)) continue
+        markdownChars += message.text.length
+        if (markdownChars >= MessageContentPreparer.HISTORY_PLAIN_FIRST_MARKDOWN_CHARACTER_THRESHOLD) {
+            return true
+        }
+    }
+    return false
+}
+
+/** Newest markdown-bearing message ids for the open viewport (bottom of chat). */
+internal fun newestMarkdownViewportIds(
+    messages: List<Message>,
+    maxCount: Int = MessageContentPreparer.HISTORY_ENRICH_VIEWPORT_MESSAGE_COUNT,
+    charBudget: Int = MessageContentPreparer.HISTORY_ENRICH_VIEWPORT_CHARACTER_BUDGET,
+): Set<String> {
+    if (messages.isEmpty() || maxCount <= 0) return emptySet()
+    val ids = LinkedHashSet<String>()
+    var remainingChars = charBudget
+    for (message in messages.asReversed()) {
+        if (!OpenCodeMarkdownDetector.shouldRender(message.text)) continue
+        ids += message.id
+        remainingChars -= message.text.length
+        if (ids.size >= maxCount || remainingChars <= 0) break
+    }
+    return ids
+}

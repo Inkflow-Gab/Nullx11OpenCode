@@ -1,0 +1,366 @@
+package dev.opencode.mobile.markdown
+
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
+
+class OpenCodeMarkdownParserTest {
+    @Test
+    fun detectorRendersBlockAndInlineMarkdown() {
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("# Heading"))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("- Item"))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("Use `inline code` here."))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("Read [the docs](https://example.com)."))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("This is **important**."))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("See https://example.com/docs for details."))
+        assertTrue(OpenCodeMarkdownDetector.shouldRender("Open <https://example.com>."))
+        assertFalse(OpenCodeMarkdownDetector.shouldRender("Plain text stays native."))
+        assertFalse(OpenCodeMarkdownDetector.shouldRender("First paragraph.\n\nSecond paragraph."))
+    }
+
+    @Test
+    fun parsesBareAndAngleBracketAutolinks() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                "Visit https://example.com/path. Also <https://opencode.ai> and [docs](https://docs.example).",
+            )
+        val paragraph = assertIs<MarkdownBlock.Paragraph>(document.blocks.single())
+        val links = paragraph.inlines.filterIsInstance<MarkdownInline.Link>()
+        assertEquals(3, links.size)
+        assertEquals("https://example.com/path", links[0].destination)
+        assertEquals(
+            listOf(MarkdownInline.Text("https://example.com/path")),
+            links[0].children,
+        )
+        assertEquals("https://opencode.ai", links[1].destination)
+        assertEquals("https://docs.example", links[2].destination)
+        assertEquals(listOf(MarkdownInline.Text("docs")), links[2].children)
+    }
+
+    @Test
+    fun bareAutolinkDoesNotConsumeTrailingSentencePunctuation() {
+        val document = OpenCodeMarkdownParser.parse("Go to https://example.com.")
+        val paragraph = assertIs<MarkdownBlock.Paragraph>(document.blocks.single())
+        assertEquals(
+            listOf(
+                MarkdownInline.Text("Go to "),
+                MarkdownInline.Link(
+                    destination = "https://example.com",
+                    children = listOf(MarkdownInline.Text("https://example.com")),
+                ),
+                MarkdownInline.Text("."),
+            ),
+            paragraph.inlines,
+        )
+    }
+
+    @Test
+    fun bareAutolinkIsSkippedInsideInlineCode() {
+        val document = OpenCodeMarkdownParser.parse("Use `https://example.com` as-is.")
+        val paragraph = assertIs<MarkdownBlock.Paragraph>(document.blocks.single())
+        assertTrue(paragraph.inlines.none { it is MarkdownInline.Link })
+        assertTrue(paragraph.inlines.any { it is MarkdownInline.Code && it.code == "https://example.com" })
+    }
+
+    @Test
+    fun parsesCodeAndDiffBlocks() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                """
+                ```kotlin
+                val answer = 42
+                ```
+
+                ```diff
+                +added
+                -deleted
+                ```
+                """.trimIndent(),
+            )
+
+        assertIs<MarkdownBlock.CodeBlock>(document.blocks[0])
+        assertIs<MarkdownBlock.DiffBlock>(document.blocks[1])
+        val code = document.blocks[0] as MarkdownBlock.CodeBlock
+        assertEquals("kotlin", code.language)
+        assertTrue(code.spans.any { it.role == CodeTokenRole.Keyword })
+        val diff = document.blocks[1] as MarkdownBlock.DiffBlock
+        assertEquals(DiffLineKind.Added, diff.lines[0].kind)
+        assertEquals(DiffLineKind.Deleted, diff.lines[1].kind)
+    }
+
+    @Test
+    fun parsesCodeBlocksWithInjectedHighlighter() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                """
+                ```sample
+                custom token
+                ```
+                """.trimIndent(),
+                codeHighlighter =
+                    object : OpenCodeCodeHighlighter {
+                        override fun supportsLanguage(languageOrAlias: String?): Boolean = languageOrAlias == "sample"
+
+                        override fun highlight(
+                            languageOrAlias: String?,
+                            code: String,
+                        ): SyntaxHighlightResult =
+                            SyntaxHighlightResult(
+                                spans = listOf(CodeSpan(start = 0, end = 6, role = CodeTokenRole.Critical)),
+                                diagnostics = emptyList(),
+                            )
+                    },
+            )
+
+        val code = assertIs<MarkdownBlock.CodeBlock>(document.blocks.single())
+        assertEquals(listOf(CodeSpan(start = 0, end = 6, role = CodeTokenRole.Critical)), code.spans)
+    }
+
+    @Test
+    fun blocksRawHtmlAndImagesAsDiagnostics() {
+        val document = OpenCodeMarkdownParser.parse("""Hello <script>nope</script> ![alt](https://example.com/a.png)""")
+
+        assertTrue(document.diagnostics.any { it.kind == MarkdownDiagnosticKind.RawHtmlLiteral })
+        assertTrue(document.diagnostics.any { it.kind == MarkdownDiagnosticKind.ImageOmitted })
+        val paragraph = assertIs<MarkdownBlock.Paragraph>(document.blocks.first())
+        assertTrue(paragraph.inlines.any { it is MarkdownInline.ImageAlt })
+    }
+
+    @Test
+    fun parsesTables() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                """
+                | A | B |
+                |---|---|
+                | 1 | `two` |
+                """.trimIndent(),
+            )
+
+        val table = assertIs<MarkdownBlock.Table>(document.blocks.first())
+        assertEquals(2, table.header.cells.size)
+        assertEquals(1, table.rows.size)
+        assertTrue(table.rows.first().cells[1].inlines.first() is MarkdownInline.Code)
+    }
+
+    @Test
+    fun rendersStreamedTableHeaderWhileDelimiterRowIsArriving() {
+        val header = "Intro\n\n| File | Lines | Status |\n"
+        for (partial in listOf("|", "| -", "| --- | -", "| --- | ---: |", "|:--|--:|  ")) {
+            val document = OpenCodeMarkdownParser.parse(header + partial)
+
+            assertEquals(2, document.blocks.size, "partial delimiter `$partial`")
+            assertIs<MarkdownBlock.Paragraph>(document.blocks[0])
+            val table = assertIs<MarkdownBlock.Table>(document.blocks[1], "partial delimiter `$partial`")
+            assertEquals(
+                listOf("File", "Lines", "Status"),
+                table.header.cells.map { cell -> (cell.inlines.single() as MarkdownInline.Text).text },
+            )
+            assertTrue(table.rows.isEmpty())
+        }
+    }
+
+    @Test
+    fun streamedTableKeepsRowsReceivedSoFar() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                "| File | Lines |\n| --- | ---: |\n| README.md | 12 |\n| src",
+            )
+
+        val table = assertIs<MarkdownBlock.Table>(document.blocks.single())
+        assertEquals(2, table.rows.size)
+        assertEquals(1, table.rows[1].cells.size)
+    }
+
+    @Test
+    fun unfinishedDelimiterRowOnlyCountsAsTableAtTheEndOfTheSource() {
+        val notTrailing = OpenCodeMarkdownParser.parse("| File | Lines |\n|\nmore text")
+        assertTrue(notTrailing.blocks.none { block -> block is MarkdownBlock.Table })
+
+        val withoutLeadingPipe = OpenCodeMarkdownParser.parse("a | b\n|")
+        assertTrue(withoutLeadingPipe.blocks.none { block -> block is MarkdownBlock.Table })
+
+        val headerOnly = OpenCodeMarkdownParser.parse("| File | Lines |\n")
+        assertTrue(headerOnly.blocks.none { block -> block is MarkdownBlock.Table })
+
+        val dataRowNotDelimiter = OpenCodeMarkdownParser.parse("| File | Lines |\n| READ")
+        assertTrue(dataRowNotDelimiter.blocks.none { block -> block is MarkdownBlock.Table })
+    }
+
+    @Test
+    fun markdownFenceClosesOnFirstBareFenceLikeCommonMark() {
+        // Match opencode web: an outer ```markdown fence closes at the first
+        // bare closing fence (after nested ```bash), so later content is real
+        // markdown — not one giant markdown CodeBlock.
+        val document =
+            OpenCodeMarkdownParser.parse(
+                """
+                ```markdown
+                # Project Documentation
+
+                ```bash
+                curl -X GET /api/users/123
+                ```
+
+                ## Configuration
+
+                ```json
+                {
+                  "username": "newuser"
+                }
+                ```
+
+                After the sample.
+                """.trimIndent(),
+            )
+
+        val markdownSample = assertIs<MarkdownBlock.CodeBlock>(document.blocks[0])
+        assertEquals("markdown", markdownSample.language)
+        assertTrue(markdownSample.code.contains("# Project Documentation"))
+        assertTrue(markdownSample.code.contains("```bash"))
+        assertTrue(markdownSample.code.contains("curl -X GET /api/users/123"))
+        assertFalse(markdownSample.code.contains("## Configuration"))
+
+        val heading = assertIs<MarkdownBlock.Heading>(document.blocks[1])
+        assertEquals(2, heading.level)
+
+        val json = assertIs<MarkdownBlock.CodeBlock>(document.blocks[2])
+        assertEquals("json", json.language)
+        assertTrue(json.code.contains("\"username\""))
+
+        val paragraph = assertIs<MarkdownBlock.Paragraph>(document.blocks[3])
+        assertEquals("After the sample.", plainTextFromMarkdownInlines(paragraph.inlines))
+    }
+
+    @Test
+    fun jsonBoundaryUsesVersionedRenderTreeSchema() {
+        val requestJson =
+            OpenCodeMarkdownJson.json.encodeToString(
+                MarkdownParseRequest(
+                    markdown =
+                        """
+                        ### Title
+
+                        | A | B |
+                        |---|---|
+                        | 1 | `two` |
+
+                        ```diff
+                        +added
+                        -deleted
+                        ```
+                        """.trimIndent(),
+                    variant = "standalone",
+                ),
+            )
+
+        val responseJson = OpenCodeMarkdownJson.parseMarkdownJson(requestJson)
+        val document = Json.parseToJsonElement(responseJson).jsonObject
+        val blocks = document.getValue("blocks").jsonArray
+
+        assertEquals(1, document.getValue("renderTreeVersion").jsonPrimitive.int)
+        assertEquals("heading", blocks[0].jsonObject.getValue("type").jsonPrimitive.content)
+        assertEquals(3, blocks[0].jsonObject.getValue("level").jsonPrimitive.int)
+        assertEquals("table", blocks[1].jsonObject.getValue("type").jsonPrimitive.content)
+        assertEquals("diffBlock", blocks[2].jsonObject.getValue("type").jsonPrimitive.content)
+
+        val diffLines = blocks[2].jsonObject.getValue("lines").jsonArray
+        assertEquals("Added", diffLines[0].jsonObject.getValue("kind").jsonPrimitive.content)
+        assertEquals("Deleted", diffLines[1].jsonObject.getValue("kind").jsonPrimitive.content)
+    }
+
+    @Test
+    fun parseColorsFencesWithHighlightCoreByDefault() {
+        val code = "val answer = 42"
+        val document = OpenCodeMarkdownParser.parse("```kotlin\n$code\n```")
+        val block = assertIs<MarkdownBlock.CodeBlock>(document.blocks.single())
+
+        assertEquals(OpenCodeHighlightCoreCodeHighlighter.highlight("kotlin", code).spans, block.spans)
+        assertTrue(block.spans.any { it.role == CodeTokenRole.Keyword })
+        assertTrue(document.diagnostics.isEmpty())
+    }
+
+    @Test
+    fun unsupportedFenceLanguageStaysPlainWithADiagnostic() {
+        val document = OpenCodeMarkdownParser.parse("```brainfuck\n++[>+<-].\n```")
+        val block = assertIs<MarkdownBlock.CodeBlock>(document.blocks.single())
+
+        assertTrue(block.spans.isEmpty())
+        assertEquals(listOf(MarkdownDiagnosticKind.UnsupportedLanguage), document.diagnostics.map { it.kind })
+    }
+
+    @Test
+    fun structureOnlyParseEmitsCodeBlocksWithoutSpans() {
+        val document =
+            OpenCodeMarkdownParser.parse(
+                markdown =
+                    """
+                    ```javascript
+                    const x = 1
+                    ```
+                    """.trimIndent(),
+                codeHighlighter = OpenCodeStructureOnlyHighlighter,
+            )
+        val code = document.blocks.filterIsInstance<MarkdownBlock.CodeBlock>().single()
+        assertEquals("javascript", code.language)
+        assertTrue(code.spans.isEmpty())
+        assertEquals(SyntaxHighlightSource.StructureOnly, OpenCodeStructureOnlyHighlighter.highlight("javascript", "const x = 1").source)
+    }
+
+    @Test
+    fun jsonBoundaryColorsFencesUnlessStructureOnly() {
+        fun spans(structureOnly: Boolean): List<CodeSpan> {
+            val requestJson =
+                OpenCodeMarkdownJson.json.encodeToString(
+                    MarkdownParseRequest(markdown = "```kotlin\nval answer = 42\n```", structureOnly = structureOnly),
+                )
+            val document = OpenCodeMarkdownJson.json.decodeFromString<MarkdownDocument>(OpenCodeMarkdownJson.parseMarkdownJson(requestJson))
+            return assertIs<MarkdownBlock.CodeBlock>(document.blocks.single()).spans
+        }
+
+        assertEquals(OpenCodeHighlightCoreCodeHighlighter.highlight("kotlin", "val answer = 42").spans, spans(structureOnly = false))
+        assertTrue(spans(structureOnly = true).isEmpty())
+    }
+
+    @Test
+    fun jsonBoundaryIgnoresFieldsItNoLongerReads() {
+        // Older app builds still send these; they must not fail the parse.
+        val requestJson = """{"markdown":"```kotlin\nval a = 1\n```","isStreaming":true,"textMateEnabled":true}"""
+        val document = OpenCodeMarkdownJson.json.decodeFromString<MarkdownDocument>(OpenCodeMarkdownJson.parseMarkdownJson(requestJson))
+
+        assertIs<MarkdownBlock.CodeBlock>(document.blocks.single())
+    }
+
+    @Test
+    fun plainTextFromInlinesMatchesReadableFallback() {
+        val inlines =
+            listOf(
+                MarkdownInline.Text("Read "),
+                MarkdownInline.Link(
+                    destination = "https://example.com",
+                    children = listOf(MarkdownInline.Text("docs")),
+                ),
+                MarkdownInline.Text(" and use "),
+                MarkdownInline.Code("inline"),
+            )
+
+        assertEquals("Read docs and use inline", plainTextFromMarkdownInlines(inlines))
+    }
+
+    @Test
+    fun stableMarkdownSourceHashDiffersForDifferentSnapshots() {
+        assertNotEquals(
+            stableMarkdownSourceHash("# Aa"),
+            stableMarkdownSourceHash("# BB"),
+        )
+    }
+}
